@@ -1,27 +1,23 @@
 #![feature(test)]
 
 extern crate test;
-#[macro_use]
-extern crate solana_core;
 
 use crossbeam_channel::unbounded;
 use log::*;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
 use solana_core::banking_stage::{create_test_recorder, BankingStage};
-use solana_core::blocktree::{get_tmp_ledger_path, Blocktree};
-use solana_core::blocktree_processor::process_entries;
 use solana_core::cluster_info::ClusterInfo;
 use solana_core::cluster_info::Node;
-use solana_core::entry::next_hash;
-use solana_core::entry::Entry;
-use solana_core::genesis_utils::{create_genesis_block, GenesisBlockInfo};
+use solana_core::genesis_utils::{create_genesis_config, GenesisConfigInfo};
 use solana_core::packet::to_packets_chunked;
 use solana_core::poh_recorder::WorkingBankEntry;
-use solana_core::service::Service;
-use solana_core::test_tx::test_tx;
+use solana_ledger::blocktree_processor::process_entries;
+use solana_ledger::entry::{next_hash, Entry};
+use solana_ledger::{blocktree::Blocktree, get_tmp_ledger_path};
+use solana_perf::test_tx::test_tx;
 use solana_runtime::bank::Bank;
-use solana_sdk::genesis_block::GenesisBlock;
+use solana_sdk::genesis_config::GenesisConfig;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
@@ -31,7 +27,6 @@ use solana_sdk::system_instruction;
 use solana_sdk::system_transaction;
 use solana_sdk::timing::{duration_as_us, timestamp};
 use solana_sdk::transaction::Transaction;
-use std::iter;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, RwLock};
@@ -57,8 +52,8 @@ fn check_txs(receiver: &Arc<Receiver<WorkingBankEntry>>, ref_tx_count: usize) {
 
 #[bench]
 fn bench_consume_buffered(bencher: &mut Bencher) {
-    let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(100_000);
-    let bank = Arc::new(Bank::new(&genesis_block));
+    let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(100_000);
+    let bank = Arc::new(Bank::new(&genesis_config));
     let ledger_path = get_tmp_ledger_path!();
     let my_pubkey = Pubkey::new_rand();
     {
@@ -85,6 +80,7 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
                 &poh_recorder,
                 &mut packets,
                 10_000,
+                None,
             );
         });
 
@@ -141,25 +137,25 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
     const PACKETS_PER_BATCH: usize = 192;
     let txes = PACKETS_PER_BATCH * num_threads * CHUNKS;
     let mint_total = 1_000_000_000_000;
-    let GenesisBlockInfo {
-        mut genesis_block,
+    let GenesisConfigInfo {
+        mut genesis_config,
         mint_keypair,
         ..
-    } = create_genesis_block(mint_total);
+    } = create_genesis_config(mint_total);
 
     // Set a high ticks_per_slot so we don't run out of ticks
     // during the benchmark
-    genesis_block.ticks_per_slot = 10_000;
+    genesis_config.ticks_per_slot = 10_000;
 
     let (verified_sender, verified_receiver) = unbounded();
     let (vote_sender, vote_receiver) = unbounded();
-    let bank = Arc::new(Bank::new(&genesis_block));
+    let bank = Arc::new(Bank::new(&genesis_config));
 
     debug!("threads: {} txs: {}", num_threads, txes);
 
     let transactions = match tx_type {
-        TransactionType::Accounts => make_accounts_txs(txes, &mint_keypair, genesis_block.hash()),
-        TransactionType::Programs => make_programs_txs(txes, genesis_block.hash()),
+        TransactionType::Accounts => make_accounts_txs(txes, &mint_keypair, genesis_config.hash()),
+        TransactionType::Programs => make_programs_txs(txes, genesis_config.hash()),
     };
 
     // fund all the accounts
@@ -168,7 +164,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             &mint_keypair,
             &tx.message.account_keys[0],
             mint_total / txes as u64,
-            genesis_block.hash(),
+            genesis_config.hash(),
         );
         let x = bank.process_transaction(&fund);
         x.unwrap();
@@ -185,13 +181,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
         assert!(r.is_ok(), "sanity parallel execution");
     }
     bank.clear_signatures();
-    let verified: Vec<_> = to_packets_chunked(&transactions.clone(), PACKETS_PER_BATCH)
-        .into_iter()
-        .map(|x| {
-            let len = x.packets.len();
-            (x, iter::repeat(1).take(len).collect())
-        })
-        .collect();
+    let verified: Vec<_> = to_packets_chunked(&transactions.clone(), PACKETS_PER_BATCH);
     let ledger_path = get_tmp_ledger_path!();
     {
         let blocktree = Arc::new(
@@ -206,6 +196,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             &poh_recorder,
             verified_receiver,
             vote_receiver,
+            None,
         );
         poh_recorder.lock().unwrap().set_bank(&bank);
 
@@ -230,7 +221,7 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
                     v.len(),
                 );
                 for xv in v {
-                    sent += xv.0.packets.len();
+                    sent += xv.packets.len();
                 }
                 verified_sender.send(v.to_vec()).unwrap();
             }
@@ -270,12 +261,12 @@ fn simulate_process_entries(
     randomize_txs: bool,
     mint_keypair: &Keypair,
     mut tx_vector: Vec<Transaction>,
-    genesis_block: &GenesisBlock,
+    genesis_config: &GenesisConfig,
     keypairs: &Vec<Keypair>,
     initial_lamports: u64,
     num_accounts: usize,
 ) {
-    let bank = Arc::new(Bank::new(genesis_block));
+    let bank = Arc::new(Bank::new(genesis_config));
 
     for i in 0..(num_accounts / 2) {
         bank.transfer(initial_lamports, mint_keypair, &keypairs[i * 2].pubkey())
@@ -297,7 +288,7 @@ fn simulate_process_entries(
         hash: next_hash(&bank.last_blockhash(), 1, &tx_vector),
         transactions: tx_vector,
     };
-    process_entries(&bank, &vec![entry], randomize_txs).unwrap();
+    process_entries(&bank, &vec![entry], randomize_txs, None).unwrap();
 }
 
 fn bench_process_entries(randomize_txs: bool, bencher: &mut Bencher) {
@@ -309,11 +300,11 @@ fn bench_process_entries(randomize_txs: bool, bencher: &mut Bencher) {
     // number of accounts need to be in multiple of 4 for correct
     // execution of the test.
     let num_accounts = entropy_multiplier * 4;
-    let GenesisBlockInfo {
-        genesis_block,
+    let GenesisConfigInfo {
+        genesis_config,
         mint_keypair,
         ..
-    } = create_genesis_block((num_accounts + 1) as u64 * initial_lamports);
+    } = create_genesis_config((num_accounts + 1) as u64 * initial_lamports);
 
     let mut keypairs: Vec<Keypair> = vec![];
     let tx_vector: Vec<Transaction> = Vec::with_capacity(num_accounts / 2);
@@ -328,7 +319,7 @@ fn bench_process_entries(randomize_txs: bool, bencher: &mut Bencher) {
             randomize_txs,
             &mint_keypair,
             tx_vector.clone(),
-            &genesis_block,
+            &genesis_config,
             &keypairs,
             initial_lamports,
             num_accounts,

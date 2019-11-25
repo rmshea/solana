@@ -60,7 +60,7 @@ fn library_open(path: &PathBuf) -> std::io::Result<Library> {
 
 #[cfg(not(windows))]
 fn library_open(path: &PathBuf) -> std::io::Result<Library> {
-    // TODO linux tls bug can cause crash on dlclose(), workaround by never unloading
+    // Linux tls bug can cause crash on dlclose(), workaround by never unloading
     Library::open(Some(path), libc::RTLD_NODELETE | libc::RTLD_NOW)
 }
 
@@ -89,8 +89,11 @@ pub fn invoke_entrypoint(
     let path = create_path(&name);
     match library_open(&path) {
         Ok(library) => unsafe {
-            let entrypoint: Symbol<instruction_processor_utils::Entrypoint> =
-                match library.get(instruction_processor_utils::ENTRYPOINT.as_bytes()) {
+            let entrypoint: Symbol<instruction_processor_utils::Entrypoint> = match library
+                .get(name.as_bytes())
+            {
+                Ok(s) => s,
+                Err(_) => match library.get(instruction_processor_utils::ENTRYPOINT.as_bytes()) {
                     Ok(s) => s,
                     Err(e) => {
                         warn!(
@@ -100,7 +103,8 @@ pub fn invoke_entrypoint(
                         );
                         return Err(InstructionError::GenericError);
                     }
-                };
+                },
+            };
             let ret = entrypoint(program_id, params, ix_data);
             symbol_cache
                 .write()

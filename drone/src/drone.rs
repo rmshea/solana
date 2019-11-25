@@ -41,7 +41,7 @@ macro_rules! socketaddr {
 }
 
 pub const TIME_SLICE: u64 = 60;
-pub const REQUEST_CAP: u64 = 100_000_000_000_000;
+pub const REQUEST_CAP: u64 = solana_sdk::native_token::SOL_LAMPORTS * 1_000_000;
 pub const DRONE_PORT: u16 = 9900;
 pub const DRONE_PORT_STR: &str = "9900";
 
@@ -121,11 +121,8 @@ impl Drone {
                     );
                     info!("Requesting airdrop of {} to {:?}", lamports, to);
 
-                    let create_instruction = system_instruction::create_user_account(
-                        &self.mint_keypair.pubkey(),
-                        &to,
-                        lamports,
-                    );
+                    let create_instruction =
+                        system_instruction::transfer(&self.mint_keypair.pubkey(), &to, lamports);
                     let message = Message::new(vec![create_instruction]);
                     Ok(Transaction::new(&[&self.mint_keypair], message, blockhash))
                 } else {
@@ -191,7 +188,7 @@ pub fn request_airdrop_transaction(
         "request_airdrop_transaction: drone_addr={} id={} lamports={} blockhash={}",
         drone_addr, id, lamports, blockhash
     );
-    // TODO: make this async tokio client
+
     let mut stream = TcpStream::connect_timeout(drone_addr, Duration::new(3, 0))?;
     stream.set_read_timeout(Some(Duration::new(10, 0)))?;
     let req = DroneRequest::GetAirdrop {
@@ -388,14 +385,7 @@ mod tests {
 
         assert_eq!(message.instructions.len(), 1);
         let instruction: SystemInstruction = deserialize(&message.instructions[0].data).unwrap();
-        assert_eq!(
-            instruction,
-            SystemInstruction::CreateAccount {
-                lamports: 2,
-                space: 0,
-                program_id: Pubkey::default()
-            }
-        );
+        assert_eq!(instruction, SystemInstruction::Transfer { lamports: 2 });
 
         let mint = Keypair::new();
         drone = Drone::new(mint, None, Some(1));
@@ -418,8 +408,7 @@ mod tests {
         bytes.put(&req[..]);
 
         let keypair = Keypair::new();
-        let expected_instruction =
-            system_instruction::create_user_account(&keypair.pubkey(), &to, lamports);
+        let expected_instruction = system_instruction::transfer(&keypair.pubkey(), &to, lamports);
         let message = Message::new(vec![expected_instruction]);
         let expected_tx = Transaction::new(&[&keypair], message, blockhash);
         let expected_bytes = serialize(&expected_tx).unwrap();

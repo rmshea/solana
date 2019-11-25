@@ -2,20 +2,20 @@
 
 use crate::pubkey::Pubkey;
 use bs58;
-use generic_array::typenum::U64;
-use generic_array::GenericArray;
+use ed25519_dalek;
+use generic_array::{typenum::U64, GenericArray};
+use hmac::Hmac;
 use rand::rngs::OsRng;
 use serde_json;
-use solana_ed25519_dalek as ed25519_dalek;
-use std::borrow::Borrow;
-use std::borrow::Cow;
-use std::error;
-use std::fmt;
-use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::mem;
-use std::path::Path;
-use std::str::FromStr;
+use std::{
+    borrow::{Borrow, Cow},
+    error, fmt,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    mem,
+    path::Path,
+    str::FromStr,
+};
 
 pub type Keypair = ed25519_dalek::Keypair;
 
@@ -117,7 +117,7 @@ impl KeypairUtil for Keypair {
 
     /// Return the public key for the given keypair
     fn pubkey(&self) -> Pubkey {
-        Pubkey::new(&self.public.as_ref())
+        Pubkey::new(self.public.as_ref())
     }
 
     fn sign_message(&self, message: &[u8]) -> Signature {
@@ -156,7 +156,23 @@ pub fn write_keypair_file(
     if let Some(outdir) = Path::new(outfile).parent() {
         fs::create_dir_all(outdir)?;
     }
-    let mut f = File::create(outfile)?;
+
+    let mut f = {
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new()
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new().mode(0o600)
+        }
+    }
+    .write(true)
+    .truncate(true)
+    .create(true)
+    .open(outfile)?;
+
     write_keypair(keypair, &mut f)
 }
 
@@ -171,13 +187,29 @@ pub fn keypair_from_seed(seed: &[u8]) -> Result<Keypair, Box<dyn error::Error>> 
     Ok(keypair)
 }
 
-pub fn gen_keypair_file(outfile: &str) -> Result<String, Box<dyn error::Error>> {
-    write_keypair_file(&Keypair::new(), outfile)
+pub fn keypair_from_seed_phrase_and_passphrase(
+    seed_phrase: &str,
+    passphrase: &str,
+) -> Result<Keypair, Box<dyn error::Error>> {
+    const PBKDF2_ROUNDS: usize = 2048;
+    const PBKDF2_BYTES: usize = 64;
+
+    let salt = format!("mnemonic{}", passphrase);
+
+    let mut seed = vec![0u8; PBKDF2_BYTES];
+    pbkdf2::pbkdf2::<Hmac<sha2::Sha512>>(
+        seed_phrase.as_bytes(),
+        salt.as_bytes(),
+        PBKDF2_ROUNDS,
+        &mut seed,
+    );
+    keypair_from_seed(&seed[..])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bip39::{Language, Mnemonic, MnemonicType, Seed};
     use std::mem;
 
     fn tmp_file_path(name: &str) -> String {
@@ -189,21 +221,62 @@ mod tests {
     }
 
     #[test]
-    fn test_gen_keypair_file() {
-        let outfile = tmp_file_path("test_gen_keypair_file.json");
-        let serialized_keypair = gen_keypair_file(&outfile).unwrap();
+    fn test_write_keypair_file() {
+        let outfile = tmp_file_path("test_write_keypair_file.json");
+        let serialized_keypair = write_keypair_file(&Keypair::new(), &outfile).unwrap();
         let keypair_vec: Vec<u8> = serde_json::from_str(&serialized_keypair).unwrap();
         assert!(Path::new(&outfile).exists());
         assert_eq!(
             keypair_vec,
             read_keypair_file(&outfile).unwrap().to_bytes().to_vec()
         );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                File::open(&outfile)
+                    .expect("open")
+                    .metadata()
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
         assert_eq!(
             read_keypair_file(&outfile).unwrap().pubkey().as_ref().len(),
             mem::size_of::<Pubkey>()
         );
         fs::remove_file(&outfile).unwrap();
         assert!(!Path::new(&outfile).exists());
+    }
+
+    #[test]
+    fn test_write_keypair_file_overwrite_ok() {
+        let outfile = tmp_file_path("test_write_keypair_file_overwrite_ok.json");
+
+        write_keypair_file(&Keypair::new(), &outfile).unwrap();
+        write_keypair_file(&Keypair::new(), &outfile).unwrap();
+    }
+
+    #[test]
+    fn test_write_keypair_file_truncate() {
+        let outfile = tmp_file_path("test_write_keypair_file_truncate.json");
+
+        write_keypair_file(&Keypair::new(), &outfile).unwrap();
+        read_keypair_file(&outfile).unwrap();
+
+        // Ensure outfile is truncated
+        {
+            let mut f = File::create(&outfile).unwrap();
+            f.write_all(String::from_utf8([b'a'; 2048].to_vec()).unwrap().as_bytes())
+                .unwrap();
+        }
+        write_keypair_file(&Keypair::new(), &outfile).unwrap();
+        read_keypair_file(&outfile).unwrap();
     }
 
     #[test]
@@ -247,5 +320,16 @@ mod tests {
             signature_base58_str.parse::<Signature>(),
             Err(ParseSignatureError::Invalid)
         );
+    }
+
+    #[test]
+    fn test_keypair_from_seed_phrase_and_passphrase() {
+        let mnemonic = Mnemonic::new(MnemonicType::Words12, Language::English);
+        let passphrase = "42";
+        let seed = Seed::new(&mnemonic, passphrase);
+        let expected_keypair = keypair_from_seed(seed.as_bytes()).unwrap();
+        let keypair =
+            keypair_from_seed_phrase_and_passphrase(mnemonic.phrase(), passphrase).unwrap();
+        assert_eq!(keypair.pubkey(), expected_keypair.pubkey());
     }
 }

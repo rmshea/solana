@@ -1,18 +1,16 @@
-use crate::{
-    cli::{
-        build_balance_message, check_account_for_fee, check_unique_pubkeys,
-        log_instruction_custom_error, CliCommand, CliConfig, CliError, ProcessResult,
-    },
-    input_parsers::*,
-    input_validators::*,
+use crate::cli::{
+    build_balance_message, check_account_for_fee, check_unique_pubkeys,
+    log_instruction_custom_error, CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult,
 };
 use clap::{value_t_or_exit, App, Arg, ArgMatches, SubCommand};
+use solana_clap_utils::{input_parsers::*, input_validators::*};
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::signature::Keypair;
 use solana_sdk::{
-    account::Account, epoch_schedule::EpochSchedule, pubkey::Pubkey, signature::KeypairUtil,
-    system_instruction::SystemError, sysvar, transaction::Transaction,
+    account::Account, pubkey::Pubkey, signature::KeypairUtil, system_instruction::SystemError,
+    transaction::Transaction,
 };
-use solana_vote_api::{
+use solana_vote_program::{
     vote_instruction::{self, VoteError},
     vote_state::{VoteAuthorize, VoteInit, VoteState},
 };
@@ -27,13 +25,13 @@ impl VoteSubCommands for App<'_, '_> {
             SubCommand::with_name("create-vote-account")
                 .about("Create a vote account")
                 .arg(
-                    Arg::with_name("vote_account_pubkey")
+                    Arg::with_name("vote_account")
                         .index(1)
-                        .value_name("VOTE ACCOUNT PUBKEY")
+                        .value_name("VOTE ACCOUNT KEYPAIR")
                         .takes_value(true)
                         .required(true)
-                        .validator(is_pubkey_or_keypair)
-                        .help("Vote account address to fund"),
+                        .validator(is_keypair_or_ask_keyword)
+                        .help("Vote account keypair to fund"),
                 )
                 .arg(
                     Arg::with_name("node_pubkey")
@@ -159,51 +157,57 @@ impl VoteSubCommands for App<'_, '_> {
     }
 }
 
-pub fn parse_vote_create_account(
-    pubkey: &Pubkey,
-    matches: &ArgMatches<'_>,
-) -> Result<CliCommand, CliError> {
-    let vote_account_pubkey = pubkey_of(matches, "vote_account_pubkey").unwrap();
+pub fn parse_vote_create_account(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
+    let vote_account = keypair_of(matches, "vote_account").unwrap();
     let node_pubkey = pubkey_of(matches, "node_pubkey").unwrap();
     let commission = value_of(&matches, "commission").unwrap_or(0);
-    let authorized_voter = pubkey_of(matches, "authorized_voter").unwrap_or(vote_account_pubkey);
-    let authorized_withdrawer = pubkey_of(matches, "authorized_withdrawer").unwrap_or(*pubkey);
+    let authorized_voter = pubkey_of(matches, "authorized_voter");
+    let authorized_withdrawer = pubkey_of(matches, "authorized_withdrawer");
 
-    Ok(CliCommand::CreateVoteAccount(
-        vote_account_pubkey,
-        VoteInit {
+    Ok(CliCommandInfo {
+        command: CliCommand::CreateVoteAccount {
+            vote_account: vote_account.into(),
             node_pubkey,
             authorized_voter,
             authorized_withdrawer,
             commission,
         },
-    ))
+        require_keypair: true,
+    })
 }
 
 pub fn parse_vote_authorize(
     matches: &ArgMatches<'_>,
     vote_authorize: VoteAuthorize,
-) -> Result<CliCommand, CliError> {
+) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey = pubkey_of(matches, "vote_account_pubkey").unwrap();
     let new_authorized_pubkey = pubkey_of(matches, "new_authorized_pubkey").unwrap();
 
-    Ok(CliCommand::VoteAuthorize(
-        vote_account_pubkey,
-        new_authorized_pubkey,
-        vote_authorize,
-    ))
-}
-
-pub fn parse_vote_get_account_command(matches: &ArgMatches<'_>) -> Result<CliCommand, CliError> {
-    let vote_account_pubkey = pubkey_of(matches, "vote_account_pubkey").unwrap();
-    let use_lamports_unit = matches.is_present("lamports");
-    Ok(CliCommand::ShowVoteAccount {
-        pubkey: vote_account_pubkey,
-        use_lamports_unit,
+    Ok(CliCommandInfo {
+        command: CliCommand::VoteAuthorize(
+            vote_account_pubkey,
+            new_authorized_pubkey,
+            vote_authorize,
+        ),
+        require_keypair: true,
     })
 }
 
-pub fn parse_vote_uptime_command(matches: &ArgMatches<'_>) -> Result<CliCommand, CliError> {
+pub fn parse_vote_get_account_command(
+    matches: &ArgMatches<'_>,
+) -> Result<CliCommandInfo, CliError> {
+    let vote_account_pubkey = pubkey_of(matches, "vote_account_pubkey").unwrap();
+    let use_lamports_unit = matches.is_present("lamports");
+    Ok(CliCommandInfo {
+        command: CliCommand::ShowVoteAccount {
+            pubkey: vote_account_pubkey,
+            use_lamports_unit,
+        },
+        require_keypair: false,
+    })
+}
+
+pub fn parse_vote_uptime_command(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
     let vote_account_pubkey = pubkey_of(matches, "vote_account_pubkey").unwrap();
     let aggregate = matches.is_present("aggregate");
     let span = if matches.is_present("span") {
@@ -211,26 +215,33 @@ pub fn parse_vote_uptime_command(matches: &ArgMatches<'_>) -> Result<CliCommand,
     } else {
         None
     };
-    Ok(CliCommand::Uptime {
-        pubkey: vote_account_pubkey,
-        aggregate,
-        span,
+    Ok(CliCommandInfo {
+        command: CliCommand::Uptime {
+            pubkey: vote_account_pubkey,
+            aggregate,
+            span,
+        },
+        require_keypair: false,
     })
 }
 
 pub fn process_create_vote_account(
     rpc_client: &RpcClient,
     config: &CliConfig,
-    vote_account_pubkey: &Pubkey,
-    vote_init: &VoteInit,
+    vote_account: &Keypair,
+    node_pubkey: &Pubkey,
+    authorized_voter: &Option<Pubkey>,
+    authorized_withdrawer: &Option<Pubkey>,
+    commission: u8,
 ) -> ProcessResult {
+    let vote_account_pubkey = vote_account.pubkey();
     check_unique_pubkeys(
-        (vote_account_pubkey, "vote_account_pubkey".to_string()),
-        (&vote_init.node_pubkey, "node_pubkey".to_string()),
+        (&vote_account_pubkey, "vote_account_pubkey".to_string()),
+        (&node_pubkey, "node_pubkey".to_string()),
     )?;
     check_unique_pubkeys(
         (&config.keypair.pubkey(), "cli keypair".to_string()),
-        (vote_account_pubkey, "vote_account_pubkey".to_string()),
+        (&vote_account_pubkey, "vote_account_pubkey".to_string()),
     )?;
     let required_balance =
         rpc_client.get_minimum_balance_for_rent_exemption(VoteState::size_of())?;
@@ -239,16 +250,26 @@ pub fn process_create_vote_account(
     } else {
         1
     };
+    let vote_init = VoteInit {
+        node_pubkey: *node_pubkey,
+        authorized_voter: authorized_voter.unwrap_or(vote_account_pubkey),
+        authorized_withdrawer: authorized_withdrawer.unwrap_or(config.keypair.pubkey()),
+        commission,
+    };
     let ixs = vote_instruction::create_account(
         &config.keypair.pubkey(),
-        vote_account_pubkey,
-        vote_init,
+        &vote_account_pubkey,
+        &vote_init,
         lamports,
     );
     let (recent_blockhash, fee_calculator) = rpc_client.get_recent_blockhash()?;
-    let mut tx = Transaction::new_signed_instructions(&[&config.keypair], ixs, recent_blockhash);
+    let mut tx = Transaction::new_signed_instructions(
+        &[&config.keypair, vote_account],
+        ixs,
+        recent_blockhash,
+    );
     check_account_for_fee(rpc_client, config, &fee_calculator, &tx.message)?;
-    let result = rpc_client.send_and_confirm_transaction(&mut tx, &[&config.keypair]);
+    let result = rpc_client.send_and_confirm_transaction(&mut tx, &[&config.keypair, vote_account]);
     log_instruction_custom_error::<SystemError>(result)
 }
 
@@ -271,26 +292,15 @@ pub fn process_vote_authorize(
         vote_authorize,           // vote or withdraw
     )];
 
-    let mut tx = Transaction::new_signed_instructions(&[&config.keypair], ixs, recent_blockhash);
+    let mut tx = Transaction::new_signed_with_payer(
+        ixs,
+        Some(&config.keypair.pubkey()),
+        &[&config.keypair],
+        recent_blockhash,
+    );
     check_account_for_fee(rpc_client, config, &fee_calculator, &tx.message)?;
     let result = rpc_client.send_and_confirm_transaction(&mut tx, &[&config.keypair]);
     log_instruction_custom_error::<VoteError>(result)
-}
-
-fn get_epoch_schedule(rpc_client: &RpcClient) -> Result<EpochSchedule, Box<dyn std::error::Error>> {
-    let epoch_schedule_account = rpc_client.get_account(&sysvar::epoch_schedule::id())?;
-
-    if epoch_schedule_account.owner != sysvar::id() {
-        return Err(CliError::RpcRequestError(format!(
-            "{:?} is not an epoch_schedule account",
-            sysvar::epoch_schedule::id()
-        ))
-        .into());
-    }
-
-    let epoch_schedule = EpochSchedule::deserialize(&epoch_schedule_account)?;
-
-    Ok(epoch_schedule)
 }
 
 fn get_vote_account(
@@ -299,7 +309,7 @@ fn get_vote_account(
 ) -> Result<(Account, VoteState), Box<dyn std::error::Error>> {
     let vote_account = rpc_client.get_account(vote_account_pubkey)?;
 
-    if vote_account.owner != solana_vote_api::id() {
+    if vote_account.owner != solana_vote_program::id() {
         return Err(CliError::RpcRequestError(
             format!("{:?} is not a vote account", vote_account_pubkey).to_string(),
         )
@@ -322,11 +332,11 @@ pub fn process_show_vote_account(
 ) -> ProcessResult {
     let (vote_account, vote_state) = get_vote_account(rpc_client, vote_account_pubkey)?;
 
-    let epoch_schedule = get_epoch_schedule(rpc_client)?;
+    let epoch_schedule = rpc_client.get_epoch_schedule()?;
 
     println!(
         "account balance: {}",
-        build_balance_message(vote_account.lamports, use_lamports_unit)
+        build_balance_message(vote_account.lamports, use_lamports_unit, true)
     );
     println!("node id: {}", vote_state.node_pubkey);
     println!("authorized voter: {}", vote_state.authorized_voter);
@@ -377,7 +387,7 @@ pub fn process_uptime(
 ) -> ProcessResult {
     let (_vote_account, vote_state) = get_vote_account(rpc_client, vote_account_pubkey)?;
 
-    let epoch_schedule = get_epoch_schedule(rpc_client)?;
+    let epoch_schedule = rpc_client.get_epoch_schedule()?;
 
     println!("Node id: {}", vote_state.node_pubkey);
     println!("Authorized voter: {}", vote_state.authorized_voter);
@@ -422,11 +432,19 @@ pub fn process_uptime(
 mod tests {
     use super::*;
     use crate::cli::{app, parse_command};
+    use solana_sdk::signature::write_keypair;
+    use tempfile::NamedTempFile;
+
+    fn make_tmp_file() -> (String, NamedTempFile) {
+        let tmp_file = NamedTempFile::new().unwrap();
+        (String::from(tmp_file.path().to_str().unwrap()), tmp_file)
+    }
 
     #[test]
     fn test_parse_command() {
         let test_commands = app("test", "desc", "version");
-        let pubkey = Pubkey::new_rand();
+        let keypair = Keypair::new();
+        let pubkey = keypair.pubkey();
         let pubkey_string = pubkey.to_string();
 
         let test_authorize_voter = test_commands.clone().get_matches_from(vec![
@@ -436,93 +454,117 @@ mod tests {
             &pubkey_string,
         ]);
         assert_eq!(
-            parse_command(&pubkey, &test_authorize_voter).unwrap(),
-            CliCommand::VoteAuthorize(pubkey, pubkey, VoteAuthorize::Voter)
+            parse_command(&test_authorize_voter).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::VoteAuthorize(pubkey, pubkey, VoteAuthorize::Voter),
+                require_keypair: true
+            }
         );
 
+        let (keypair_file, mut tmp_file) = make_tmp_file();
+        let keypair = Keypair::new();
+        write_keypair(&keypair, tmp_file.as_file_mut()).unwrap();
         // Test CreateVoteAccount SubCommand
         let node_pubkey = Pubkey::new_rand();
         let node_pubkey_string = format!("{}", node_pubkey);
         let test_create_vote_account = test_commands.clone().get_matches_from(vec![
             "test",
             "create-vote-account",
-            &pubkey_string,
+            &keypair_file,
             &node_pubkey_string,
             "--commission",
             "10",
         ]);
         assert_eq!(
-            parse_command(&pubkey, &test_create_vote_account).unwrap(),
-            CliCommand::CreateVoteAccount(
-                pubkey,
-                VoteInit {
+            parse_command(&test_create_vote_account).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::CreateVoteAccount {
+                    vote_account: keypair.into(),
                     node_pubkey,
-                    authorized_voter: pubkey,
-                    authorized_withdrawer: pubkey,
-                    commission: 10
-                }
-            )
+                    authorized_voter: None,
+                    authorized_withdrawer: None,
+                    commission: 10,
+                },
+                require_keypair: true
+            }
         );
+
+        let (keypair_file, mut tmp_file) = make_tmp_file();
+        let keypair = Keypair::new();
+        write_keypair(&keypair, tmp_file.as_file_mut()).unwrap();
+
         let test_create_vote_account2 = test_commands.clone().get_matches_from(vec![
             "test",
             "create-vote-account",
-            &pubkey_string,
+            &keypair_file,
             &node_pubkey_string,
         ]);
         assert_eq!(
-            parse_command(&pubkey, &test_create_vote_account2).unwrap(),
-            CliCommand::CreateVoteAccount(
-                pubkey,
-                VoteInit {
+            parse_command(&test_create_vote_account2).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::CreateVoteAccount {
+                    vote_account: keypair.into(),
                     node_pubkey,
-                    authorized_voter: pubkey,
-                    authorized_withdrawer: pubkey,
-                    commission: 0
-                }
-            )
+                    authorized_voter: None,
+                    authorized_withdrawer: None,
+                    commission: 0,
+                },
+                require_keypair: true
+            }
         );
+
         // test init with an authed voter
         let authed = Pubkey::new_rand();
+        let (keypair_file, mut tmp_file) = make_tmp_file();
+        let keypair = Keypair::new();
+        write_keypair(&keypair, tmp_file.as_file_mut()).unwrap();
+
         let test_create_vote_account3 = test_commands.clone().get_matches_from(vec![
             "test",
             "create-vote-account",
-            &pubkey_string,
+            &keypair_file,
             &node_pubkey_string,
             "--authorized-voter",
             &authed.to_string(),
         ]);
         assert_eq!(
-            parse_command(&pubkey, &test_create_vote_account3).unwrap(),
-            CliCommand::CreateVoteAccount(
-                pubkey,
-                VoteInit {
+            parse_command(&test_create_vote_account3).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::CreateVoteAccount {
+                    vote_account: keypair.into(),
                     node_pubkey,
-                    authorized_voter: authed,
-                    authorized_withdrawer: pubkey,
+                    authorized_voter: Some(authed),
+                    authorized_withdrawer: None,
                     commission: 0
-                }
-            )
+                },
+                require_keypair: true
+            }
         );
+
+        let (keypair_file, mut tmp_file) = make_tmp_file();
+        let keypair = Keypair::new();
+        write_keypair(&keypair, tmp_file.as_file_mut()).unwrap();
         // test init with an authed withdrawer
         let test_create_vote_account4 = test_commands.clone().get_matches_from(vec![
             "test",
             "create-vote-account",
-            &pubkey_string,
+            &keypair_file,
             &node_pubkey_string,
             "--authorized-withdrawer",
             &authed.to_string(),
         ]);
         assert_eq!(
-            parse_command(&pubkey, &test_create_vote_account4).unwrap(),
-            CliCommand::CreateVoteAccount(
-                pubkey,
-                VoteInit {
+            parse_command(&test_create_vote_account4).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::CreateVoteAccount {
+                    vote_account: keypair.into(),
                     node_pubkey,
-                    authorized_voter: pubkey,
-                    authorized_withdrawer: authed,
+                    authorized_voter: None,
+                    authorized_withdrawer: Some(authed),
                     commission: 0
-                }
-            )
+                },
+                require_keypair: true
+            }
         );
 
         // Test Uptime Subcommand
@@ -536,13 +578,15 @@ mod tests {
             "--aggregate",
         ]);
         assert_eq!(
-            parse_command(&pubkey, &matches).unwrap(),
-            CliCommand::Uptime {
-                pubkey,
-                aggregate: true,
-                span: Some(4)
+            parse_command(&matches).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::Uptime {
+                    pubkey,
+                    aggregate: true,
+                    span: Some(4)
+                },
+                require_keypair: false
             }
         );
     }
-    // TODO: Add process tests
 }

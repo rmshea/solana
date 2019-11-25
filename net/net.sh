@@ -35,11 +35,11 @@ Operate a configured testnet
    -r / --skip-setup                  - Reuse existing node/ledger configuration from a
                                         previous |start| (ie, don't run ./multinode-demo/setup.sh).
    -d / --debug                       - Build/deploy the testnet with debug binaries
-   -D /path/to/programs               - Deploy custom programs from this location
    -c clientType=numClients=extraArgs - Number of clientTypes to start.  This options can be specified
                                         more than once.  Defaults to bench-tps for all clients if not
                                         specified.
                                         Valid client types are:
+                                            idle
                                             bench-tps
                                             bench-exchange
                                         User can optionally provide extraArgs that are transparently
@@ -48,7 +48,7 @@ Operate a configured testnet
                                             -c bench-tps=2="--tx_count 25000"
                                         This will start 2 bench-tps clients, and supply "--tx_count 25000"
                                         to the bench-tps client.
-   -n NUM_FULL_NODES                  - Number of fullnodes to apply command to.
+   -n NUM_VALIDATORS                  - Number of validators to apply command to.
    --gpu-mode GPU_MODE                - Specify GPU mode to launch validators with (default: $gpuMode).
                                         MODE must be one of
                                           on - GPU *required*, any vendor *
@@ -59,19 +59,19 @@ Operate a configured testnet
    --hashes-per-tick NUM_HASHES|sleep|auto
                                       - Override the default --hashes-per-tick for the cluster
    --no-airdrop
-                                      - If set, disables airdrops.  Nodes must be funded in genesis block when airdrops are disabled.
-   --lamports NUM_LAMPORTS_TO_MINT
-                                      - Override the default 100000000000000 lamports minted in genesis
+                                      - If set, disables airdrops.  Nodes must be funded in genesis config when airdrops are disabled.
+   --faucet-lamports NUM_LAMPORTS_TO_MINT
+                                      - Override the default 500000000000000000 lamports minted in genesis
    --internal-nodes-stake-lamports NUM_LAMPORTS_PER_NODE
                                       - Amount to stake internal nodes.
    --internal-nodes-lamports NUM_LAMPORTS_PER_NODE
-                                      - Amount to fund internal nodes in genesis block.
+                                      - Amount to fund internal nodes in genesis config.
    --external-accounts-file FILE_PATH
                                       - A YML file with a list of account pubkeys and corresponding lamport balances
-                                        in genesis block for external nodes
+                                        in genesis config for external nodes
    --no-snapshot-fetch
                                       - If set, disables booting validators from a snapshot
-   --skip-ledger-verify
+   --skip-poh-verify
                                       - If set, validators will skip verifying
                                         the ledger they already have saved to disk at
                                         boot (results in a much faster boot)
@@ -85,9 +85,14 @@ Operate a configured testnet
    --deploy-if-newer                  - Only deploy if newer software is
                                         available (requires -t or -T)
 
+   --use-move                         - Build the move-loader-program and add it to the cluster
+
+   --operating-mode development|softlaunch
+                                      - Specify whether or not to launch the cluster in "development" mode with all features enabled at epoch 0,
+                                        or "softlaunch" mode with some features disabled at epoch 0 (default: development)
+
  sanity/start-specific options:
    -F                   - Discard validator nodes that didn't bootup successfully
-   -o noValidatorSanity - Skip fullnode sanity
    -o noInstallCheck    - Skip solana-install sanity
    -o rejectExtraNodes  - Require the exact number of nodes
 
@@ -96,6 +101,12 @@ Operate a configured testnet
 
  logs-specific options:
    none
+
+ netem-specific options:
+   --config            - Netem configuration (as a double quoted string)
+   --parition          - Percentage of network that should be configured with netem
+   --config-file       - Configuration file for partition and netem configuration
+   --netem-cmd         - Optional command argument to netem. Default is "add". Use "cleanup" to remove rules.
 
  update-specific options:
    --platform linux|osx|windows       - Deploy the tarball using 'solana-install deploy ...' for the
@@ -116,16 +127,16 @@ deployMethod=local
 deployIfNewer=
 sanityExtraArgs=
 skipSetup=false
-customPrograms=
 updatePlatforms=
 nodeAddress=
+numIdleClients=0
 numBenchTpsClients=0
 numBenchExchangeClients=0
 benchTpsExtraArgs=
 benchExchangeExtraArgs=
 failOnValidatorBootupFailure=true
 genesisOptions=
-numFullnodesRequested=
+numValidatorsRequested=
 externalPrimordialAccountsFile=
 remoteExternalPrimordialAccountsFile=
 internalNodesStakeLamports=
@@ -137,6 +148,11 @@ maybeDisableAirdrops=""
 debugBuild=false
 doBuild=true
 gpuMode=auto
+maybeUseMove=""
+netemPartition=""
+netemConfig=""
+netemConfigFile=""
+netemCommand="add"
 
 command=$1
 [[ -n $command ]] || usage
@@ -148,10 +164,24 @@ while [[ -n $1 ]]; do
     if [[ $1 = --hashes-per-tick ]]; then
       genesisOptions="$genesisOptions $1 $2"
       shift 2
+    elif [[ $1 = --slots-per-epoch ]]; then
+      genesisOptions="$genesisOptions $1 $2"
+      shift 2
     elif [[ $1 = --target-lamports-per-signature ]]; then
       genesisOptions="$genesisOptions $1 $2"
       shift 2
-    elif [[ $1 = --lamports ]]; then
+    elif [[ $1 = --faucet-lamports ]]; then
+      genesisOptions="$genesisOptions $1 $2"
+      shift 2
+    elif [[ $1 = --operating-mode ]]; then
+      case "$2" in
+        development|softlaunch)
+          ;;
+        *)
+          echo "Unexpected operating mode: \"$2\""
+          exit 1
+          ;;
+      esac
       genesisOptions="$genesisOptions $1 $2"
       shift 2
     elif [[ $1 = --no-snapshot-fetch ]]; then
@@ -169,7 +199,7 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --limit-ledger-size ]]; then
       maybeLimitLedgerSize="$1"
       shift 1
-    elif [[ $1 = --skip-ledger-verify ]]; then
+    elif [[ $1 = --skip-poh-verify ]]; then
       maybeSkipLedgerVerify="$1"
       shift 1
     elif [[ $1 = --skip-setup ]]; then
@@ -194,6 +224,21 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --debug ]]; then
       debugBuild=true
       shift 1
+    elif [[ $1 = --use-move ]]; then
+      maybeUseMove=$1
+      shift 1
+    elif [[ $1 = --partition ]]; then
+      netemPartition=$2
+      shift 2
+    elif [[ $1 = --config ]]; then
+      netemConfig=$2
+      shift 2
+    elif [[ $1 == --config-file ]]; then
+      netemConfigFile=$2
+      shift 2
+    elif [[ $1 == --netem-cmd ]]; then
+      netemCommand=$2
+      shift 2
     elif [[ $1 = --gpu-mode ]]; then
       gpuMode=$2
       case "$gpuMode" in
@@ -214,7 +259,7 @@ while [[ -n $1 ]]; do
   fi
 done
 
-while getopts "h?T:t:o:f:rD:c:Fn:i:d" opt "${shortArgs[@]}"; do
+while getopts "h?T:t:o:f:rc:Fn:i:d" opt "${shortArgs[@]}"; do
   case $opt in
   h | \?)
     usage
@@ -236,17 +281,14 @@ while getopts "h?T:t:o:f:rD:c:Fn:i:d" opt "${shortArgs[@]}"; do
     esac
     ;;
   n)
-    numFullnodesRequested=$OPTARG
+    numValidatorsRequested=$OPTARG
     ;;
   r)
     skipSetup=true
     ;;
-  D)
-    customPrograms=$OPTARG
-    ;;
   o)
     case $OPTARG in
-    noValidatorSanity|rejectExtraNodes|noInstallCheck)
+    rejectExtraNodes|noInstallCheck)
       sanityExtraArgs="$sanityExtraArgs -o $OPTARG"
       ;;
     *)
@@ -271,6 +313,10 @@ while getopts "h?T:t:o:f:rD:c:Fn:i:d" opt "${shortArgs[@]}"; do
         exit 1
       fi
       case $clientType in
+        idle)
+          numIdleClients=$numClients
+          # $extraArgs ignored for 'idle'
+        ;;
         bench-tps)
           numBenchTpsClients=$numClients
           benchTpsExtraArgs=$extraArgs
@@ -304,17 +350,35 @@ done
 
 loadConfigFile
 
-if [[ -n $numFullnodesRequested ]]; then
-  truncatedNodeList=( "${fullnodeIpList[@]:0:$numFullnodesRequested}" )
-  unset fullnodeIpList
-  fullnodeIpList=( "${truncatedNodeList[@]}" )
+netLogDir=
+initLogDir() { # Initializes the netLogDir global variable.  Idempotent
+  [[ -z $netLogDir ]] || return 0
+
+  netLogDir="$netDir"/log
+  declare netLogDateDir
+  netLogDateDir="$netDir"/log-$(date +"%Y-%m-%d_%H_%M_%S")
+  if [[ -d $netLogDir && ! -L $netLogDir ]]; then
+    echo "Warning: moving $netLogDir to make way for symlink."
+    mv "$netLogDir" "$netDir"/log.old
+  elif [[ -L $netLogDir ]]; then
+    rm "$netLogDir"
+  fi
+  mkdir -p "$netConfigDir" "$netLogDateDir"
+  ln -sf "$netLogDateDir" "$netLogDir"
+  echo "Log directory: $netLogDateDir"
+}
+
+if [[ -n $numValidatorsRequested ]]; then
+  truncatedNodeList=( "${validatorIpList[@]:0:$numValidatorsRequested}" )
+  unset validatorIpList
+  validatorIpList=( "${truncatedNodeList[@]}" )
 fi
 
 numClients=${#clientIpList[@]}
-numClientsRequested=$((numBenchTpsClients+numBenchExchangeClients))
+numClientsRequested=$((numBenchTpsClients + numBenchExchangeClients + numIdleClients))
 if [[ "$numClientsRequested" -eq 0 ]]; then
   numBenchTpsClients=$numClients
-  numClientsRequested=$((numBenchTpsClients+numBenchExchangeClients))
+  numClientsRequested=$numClients
 else
   if [[ "$numClientsRequested" -gt "$numClients" ]]; then
     echo "Error: More clients requested ($numClientsRequested) then available ($numClients)"
@@ -359,10 +423,7 @@ build() {
 
     $MAYBE_DOCKER bash -c "
       set -ex
-      scripts/cargo-install-all.sh farf \"$buildVariant\"
-      if [[ -n \"$customPrograms\" ]]; then
-        scripts/cargo-install-custom-programs.sh farf $customPrograms
-      fi
+      scripts/cargo-install-all.sh farf \"$buildVariant\" \"$maybeUseMove\"
     "
   )
   echo "Build took $SECONDS seconds"
@@ -390,6 +451,7 @@ startCommon() {
   fi
   [[ -z "$externalNodeSshKey" ]] || ssh-copy-id -f -i "$externalNodeSshKey" "${sshOptions[@]}" "solana@$ipAddress"
   rsync -vPrc -e "ssh ${sshOptions[*]}" \
+    --exclude 'net/log*' \
     "$SOLANA_ROOT"/{fetch-perf-libs.sh,scripts,net,multinode-demo} \
     "$ipAddress":~/solana/
 }
@@ -401,7 +463,7 @@ startBootstrapLeader() {
   echo "--- Starting bootstrap leader: $ipAddress"
   echo "start log: $logFile"
 
-  # Deploy local binaries to bootstrap fullnode.  Other fullnodes and clients later fetch the
+  # Deploy local binaries to bootstrap validator.  Other validators and clients later fetch the
   # binaries from it
   (
     set -x
@@ -429,7 +491,7 @@ startBootstrapLeader() {
          $deployMethod \
          bootstrap-leader \
          $entrypointIp \
-         $((${#fullnodeIpList[@]} + ${#blockstreamerIpList[@]} + ${#replicatorIpList[@]})) \
+         $((${#validatorIpList[@]} + ${#blockstreamerIpList[@]} + ${#archiverIpList[@]})) \
          \"$RUST_LOG\" \
          $skipSetup \
          $failOnValidatorBootupFailure \
@@ -443,7 +505,9 @@ startBootstrapLeader() {
          \"$genesisOptions\" \
          \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize\" \
          \"$gpuMode\" \
+         \"$GEOLOCATION_API_KEY\" \
       "
+
   ) >> "$logFile" 2>&1 || {
     cat "$logFile"
     echo "^^^ +++"
@@ -455,7 +519,9 @@ startNode() {
   declare ipAddress=$1
   declare nodeType=$2
   declare nodeIndex="$3"
-  declare logFile="$netLogDir/fullnode-$ipAddress.log"
+
+  initLogDir
+  declare logFile="$netLogDir/validator-$ipAddress.log"
 
   if [[ -z $nodeType ]]; then
     echo nodeType not specified
@@ -494,7 +560,7 @@ startNode() {
          $deployMethod \
          $nodeType \
          $entrypointIp \
-         $((${#fullnodeIpList[@]} + ${#blockstreamerIpList[@]} + ${#replicatorIpList[@]})) \
+         $((${#validatorIpList[@]} + ${#blockstreamerIpList[@]} + ${#archiverIpList[@]})) \
          \"$RUST_LOG\" \
          $skipSetup \
          $failOnValidatorBootupFailure \
@@ -508,10 +574,11 @@ startNode() {
          \"$genesisOptions\" \
          \"$maybeNoSnapshot $maybeSkipLedgerVerify $maybeLimitLedgerSize\" \
          \"$gpuMode\" \
+         \"$GEOLOCATION_API_KEY\" \
       "
   ) >> "$logFile" 2>&1 &
   declare pid=$!
-  ln -sf "fullnode-$ipAddress.log" "$netLogDir/fullnode-$pid.log"
+  ln -sf "validator-$ipAddress.log" "$netLogDir/validator-$pid.log"
   pids+=("$pid")
 }
 
@@ -519,7 +586,10 @@ startClient() {
   declare ipAddress=$1
   declare clientToRun="$2"
   declare clientIndex="$3"
+
+  initLogDir
   declare logFile="$netLogDir/client-$clientToRun-$ipAddress.log"
+
   echo "--- Starting client: $ipAddress - $clientToRun"
   echo "start log: $logFile"
   (
@@ -541,7 +611,7 @@ sanity() {
   $metricsWriteDatapoint "testnet-deploy net-sanity-begin=1"
 
   declare ok=true
-  declare bootstrapLeader=${fullnodeIpList[0]}
+  declare bootstrapLeader=${validatorIpList[0]}
   declare blockstreamer=${blockstreamerIpList[0]}
 
   annotateBlockexplorerUrl
@@ -562,7 +632,7 @@ sanity() {
       set -x
       # shellcheck disable=SC2029 # remote-client.sh args are expanded on client side intentionally
       ssh "${sshOptions[@]}" "$blockstreamer" \
-        "./solana/net/remote/remote-sanity.sh $blockstreamer $sanityExtraArgs -o noValidatorSanity \"$RUST_LOG\""
+        "./solana/net/remote/remote-sanity.sh $blockstreamer $sanityExtraArgs \"$RUST_LOG\""
     ) || ok=false
     $ok || exit 1
   fi
@@ -581,7 +651,7 @@ deployUpdate() {
   fi
 
   declare ok=true
-  declare bootstrapLeader=${fullnodeIpList[0]}
+  declare bootstrapLeader=${validatorIpList[0]}
 
   for updatePlatform in $updatePlatforms; do
     echo "--- Deploying solana-install update: $updatePlatform"
@@ -610,12 +680,12 @@ getNodeType() {
   nodeIndex=0 # <-- global
   nodeType=validator # <-- global
 
-  for ipAddress in "${fullnodeIpList[@]}" b "${blockstreamerIpList[@]}" r "${replicatorIpList[@]}"; do
+  for ipAddress in "${validatorIpList[@]}" b "${blockstreamerIpList[@]}" r "${archiverIpList[@]}"; do
     if [[ $ipAddress = b ]]; then
       nodeType=blockstreamer
       continue
     elif [[ $ipAddress = r ]]; then
-      nodeType=replicator
+      nodeType=archiver
       continue
     fi
 
@@ -673,7 +743,7 @@ prepare_deploy() {
     echo "Fetching current software version"
     (
       set -x
-      rsync -vPrc -e "ssh ${sshOptions[*]}" "${fullnodeIpList[0]}":~/version.yml current-version.yml
+      rsync -vPrc -e "ssh ${sshOptions[*]}" "${validatorIpList[0]}":~/version.yml current-version.yml
     )
     cat current-version.yml
     if ! diff -q current-version.yml "$SOLANA_ROOT"/solana-release/version.yml; then
@@ -686,11 +756,13 @@ prepare_deploy() {
 }
 
 deploy() {
+  initLogDir
+
   echo "Deployment started at $(date)"
   $metricsWriteDatapoint "testnet-deploy net-start-begin=1"
 
   declare bootstrapLeader=true
-  for nodeAddress in "${fullnodeIpList[@]}" "${blockstreamerIpList[@]}" "${replicatorIpList[@]}"; do
+  for nodeAddress in "${validatorIpList[@]}" "${blockstreamerIpList[@]}" "${archiverIpList[@]}"; do
     nodeType=
     nodeIndex=
     getNodeType
@@ -710,9 +782,7 @@ deploy() {
       # Stagger additional node start time. If too many nodes start simultaneously
       # the bootstrap node gets more rsync requests from the additional nodes than
       # it can handle.
-      if ((nodeIndex % 2 == 0)); then
-        sleep 2
-      fi
+      sleep 2
     fi
   done
 
@@ -721,8 +791,8 @@ deploy() {
     declare ok=true
     wait "$pid" || ok=false
     if ! $ok; then
-      echo "+++ fullnode failed to start"
-      cat "$netLogDir/fullnode-$pid.log"
+      echo "+++ validator failed to start"
+      cat "$netLogDir/validator-$pid.log"
       if $failOnValidatorBootupFailure; then
         exit 1
       else
@@ -731,7 +801,7 @@ deploy() {
     fi
   done
 
-  $metricsWriteDatapoint "testnet-deploy net-fullnodes-started=1"
+  $metricsWriteDatapoint "testnet-deploy net-validators-started=1"
   additionalNodeDeployTime=$SECONDS
 
   annotateBlockexplorerUrl
@@ -743,8 +813,10 @@ deploy() {
   for ((i=0; i < "$numClients" && i < "$numClientsRequested"; i++)) do
     if [[ $i -lt "$numBenchTpsClients" ]]; then
       startClient "${clientIpList[$i]}" "solana-bench-tps" "$i"
-    else
+    elif [[ $i -lt $((numBenchTpsClients + numBenchExchangeClients)) ]]; then
       startClient "${clientIpList[$i]}" "solana-bench-exchange" $((i-numBenchTpsClients))
+    else
+      startClient "${clientIpList[$i]}" "idle"
     fi
   done
   clientDeployTime=$SECONDS
@@ -775,16 +847,18 @@ deploy() {
   echo
   echo "+++ Deployment Successful"
   echo "Bootstrap leader deployment took $bootstrapNodeDeployTime seconds"
-  echo "Additional fullnode deployment (${#fullnodeIpList[@]} full nodes, ${#blockstreamerIpList[@]} blockstreamer nodes, ${#replicatorIpList[@]} replicators) took $additionalNodeDeployTime seconds"
+  echo "Additional validator deployment (${#validatorIpList[@]} validators, ${#blockstreamerIpList[@]} blockstreamer nodes, ${#archiverIpList[@]} archivers) took $additionalNodeDeployTime seconds"
   echo "Client deployment (${#clientIpList[@]} instances) took $clientDeployTime seconds"
   echo "Network start logs in $netLogDir"
 }
 
-
 stopNode() {
   local ipAddress=$1
   local block=$2
-  declare logFile="$netLogDir/stop-fullnode-$ipAddress.log"
+
+  initLogDir
+  declare logFile="$netLogDir/stop-validator-$ipAddress.log"
+
   echo "--- Stopping node: $ipAddress"
   echo "stop log: $logFile"
   (
@@ -794,12 +868,22 @@ stopNode() {
       PS4=\"$PS4\"
       set -x
       ! tmux list-sessions || tmux kill-session
-      for pid in solana/{blockexplorer,net-stats,fd-monitor,oom-monitor}.pid; do
+      declare sudo=
+      if sudo true; then
+        sudo=\"sudo -n\"
+      fi
+
+      for pid in solana/*.pid; do
         pgid=\$(ps opgid= \$(cat \$pid) | tr -d '[:space:]')
         if [[ -n \$pgid ]]; then
-          sudo kill -- -\$pgid
+          \$sudo kill -- -\$pgid
         fi
       done
+      if [[ -f solana/netem.cfg ]]; then
+        solana/scripts/netem.sh delete < solana/netem.cfg
+        rm -f solana/netem.cfg
+      fi
+      solana/scripts/net-shaper.sh force_cleanup
       for pattern in node solana- remote-; do
         pkill -9 \$pattern
       done
@@ -807,7 +891,7 @@ stopNode() {
   ) >> "$logFile" 2>&1 &
 
   declare pid=$!
-  ln -sf "stop-fullnode-$ipAddress.log" "$netLogDir/stop-fullnode-$pid.log"
+  ln -sf "stop-validator-$ipAddress.log" "$netLogDir/stop-validator-$pid.log"
   if $block; then
     wait $pid
   else
@@ -821,7 +905,7 @@ stop() {
 
   declare loopCount=0
   pids=()
-  for ipAddress in "${fullnodeIpList[@]}" "${blockstreamerIpList[@]}" "${replicatorIpList[@]}" "${clientIpList[@]}"; do
+  for ipAddress in "${validatorIpList[@]}" "${blockstreamerIpList[@]}" "${archiverIpList[@]}" "${clientIpList[@]}"; do
     stopNode "$ipAddress" false
 
     # Stagger additional node stop time to avoid too many concurrent ssh
@@ -840,15 +924,14 @@ stop() {
   echo "Stopping nodes took $SECONDS seconds"
 }
 
-
 checkPremptibleInstances() {
-  # The fullnodeIpList nodes may be preemptible instances that can disappear at
-  # any time.  Try to detect when a fullnode has been preempted to help the user
+  # The validatorIpList nodes may be preemptible instances that can disappear at
+  # any time.  Try to detect when a validator has been preempted to help the user
   # out.
   #
   # Of course this isn't airtight as an instance could always disappear
   # immediately after its successfully pinged.
-  for ipAddress in "${fullnodeIpList[@]}"; do
+  for ipAddress in "${validatorIpList[@]}"; do
     (
       set -x
       timeout 5s ping -c 1 "$ipAddress" | tr - _
@@ -903,6 +986,7 @@ startnode)
   startNode "$nodeAddress" $nodeType $nodeIndex
   ;;
 logs)
+  initLogDir
   fetchRemoteLog() {
     declare ipAddress=$1
     declare log=$2
@@ -913,21 +997,51 @@ logs)
         "$ipAddress":solana/"$log".log "$netLogDir"/remote-"$log"-"$ipAddress".log
     ) || echo "failed to fetch log"
   }
-  fetchRemoteLog "${fullnodeIpList[0]}" drone
-  for ipAddress in "${fullnodeIpList[@]}"; do
-    fetchRemoteLog "$ipAddress" fullnode
+  fetchRemoteLog "${validatorIpList[0]}" drone
+  for ipAddress in "${validatorIpList[@]}"; do
+    fetchRemoteLog "$ipAddress" validator
   done
   for ipAddress in "${clientIpList[@]}"; do
     fetchRemoteLog "$ipAddress" client
   done
   for ipAddress in "${blockstreamerIpList[@]}"; do
-    fetchRemoteLog "$ipAddress" fullnode
+    fetchRemoteLog "$ipAddress" validator
   done
-  for ipAddress in "${replicatorIpList[@]}"; do
-    fetchRemoteLog "$ipAddress" fullnode
+  for ipAddress in "${archiverIpList[@]}"; do
+    fetchRemoteLog "$ipAddress" validator
   done
   ;;
+netem)
+  if [[ -n $netemConfigFile ]]; then
+    if [[ $netemCommand = "add" ]]; then
+      for ipAddress in "${validatorIpList[@]}"; do
+        "$here"/scp.sh "$netemConfigFile" solana@"$ipAddress":~/solana
+      done
+    fi
+    for i in "${!validatorIpList[@]}"; do
+      "$here"/ssh.sh solana@"${validatorIpList[$i]}" 'solana/scripts/net-shaper.sh' \
+      "$netemCommand" ~solana/solana/"$netemConfigFile" "${#validatorIpList[@]}" "$i"
+    done
+  else
+    num_nodes=$((${#validatorIpList[@]}*netemPartition/100))
+    if [[ $((${#validatorIpList[@]}*netemPartition%100)) -gt 0 ]]; then
+      num_nodes=$((num_nodes+1))
+    fi
+    if [[ "$num_nodes" -gt "${#validatorIpList[@]}" ]]; then
+      num_nodes=${#validatorIpList[@]}
+    fi
 
+    # Stop netem on all nodes
+    for ipAddress in "${validatorIpList[@]}"; do
+      "$here"/ssh.sh solana@"$ipAddress" 'solana/scripts/netem.sh delete < solana/netem.cfg || true'
+    done
+
+    # Start netem on required nodes
+    for ((i=0; i<num_nodes; i++ )); do :
+      "$here"/ssh.sh solana@"${validatorIpList[$i]}" "echo $netemConfig > solana/netem.cfg; solana/scripts/netem.sh add \"$netemConfig\""
+    done
+  fi
+  ;;
 *)
   echo "Internal error: Unknown command: $command"
   usage

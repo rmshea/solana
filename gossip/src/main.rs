@@ -1,50 +1,43 @@
 //! A command-line executable for monitoring a cluster's gossip plane.
 
-#[macro_use]
-extern crate solana_core;
-
 use clap::{
-    crate_description, crate_name, crate_version, value_t_or_exit, App, AppSettings, Arg,
+    crate_description, crate_name, value_t, value_t_or_exit, App, AppSettings, Arg, ArgMatches,
     SubCommand,
 };
+use solana_clap_utils::input_validators::{is_port, is_pubkey};
 use solana_client::rpc_client::RpcClient;
-use solana_core::contact_info::ContactInfo;
-use solana_core::gossip_service::discover;
+use solana_core::{contact_info::ContactInfo, gossip_service::discover};
 use solana_sdk::pubkey::Pubkey;
 use std::error;
 use std::net::SocketAddr;
 use std::process::exit;
 
-fn is_pubkey(pubkey: String) -> Result<(), String> {
-    match pubkey.parse::<Pubkey>() {
-        Ok(_) => Ok(()),
-        Err(err) => Err(format!("{:?}", err)),
-    }
-}
-
 fn main() -> Result<(), Box<dyn error::Error>> {
     solana_logger::setup_with_filter("solana=info");
 
-    let mut entrypoint_addr = SocketAddr::from(([127, 0, 0, 1], 8001));
-    let entrypoint_string = entrypoint_addr.to_string();
     let matches = App::new(crate_name!())
         .about(crate_description!())
-        .version(crate_version!())
+        .version(solana_clap_utils::version!())
         .setting(AppSettings::SubcommandRequiredElseHelp)
-        .arg(
-            Arg::with_name("entrypoint")
-                .short("n")
-                .long("entrypoint")
-                .value_name("HOST:PORT")
-                .takes_value(true)
-                .default_value(&entrypoint_string)
-                .validator(solana_netutil::is_host_port)
-                .global(true)
-                .help("Rendezvous with the cluster at this entry point"),
-        )
         .subcommand(
             SubCommand::with_name("get-rpc-url")
                 .about("Get an RPC URL for the cluster")
+                .arg(
+                    Arg::with_name("entrypoint")
+                        .short("n")
+                        .long("entrypoint")
+                        .value_name("HOST:PORT")
+                        .takes_value(true)
+                        .required(true)
+                        .validator(solana_net_utils::is_host_port)
+                        .help("Rendezvous with the cluster at this entry point"),
+                )
+                .arg(
+                    Arg::with_name("all")
+                        .long("all")
+                        .takes_value(false)
+                        .help("Return all RPC URLs"),
+                )
                 .arg(
                     Arg::with_name("timeout")
                         .long("timeout")
@@ -59,6 +52,32 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             SubCommand::with_name("spy")
                 .about("Monitor the gossip entrypoint")
                 .setting(AppSettings::DisableVersion)
+                .arg(
+                    Arg::with_name("entrypoint")
+                        .short("n")
+                        .long("entrypoint")
+                        .value_name("HOST:PORT")
+                        .takes_value(true)
+                        .validator(solana_net_utils::is_host_port)
+                        .help("Rendezvous with the cluster at this entrypoint"),
+                )
+                .arg(
+                    clap::Arg::with_name("gossip_port")
+                        .long("gossip-port")
+                        .value_name("PORT")
+                        .takes_value(true)
+                        .validator(is_port)
+                        .help("Gossip port number for the node"),
+                )
+                .arg(
+                    clap::Arg::with_name("gossip_host")
+                        .long("gossip-host")
+                        .value_name("HOST")
+                        .takes_value(true)
+                        .conflicts_with("entrypoint")
+                        .validator(solana_net_utils::is_host)
+                        .help("Gossip DNS name or IP address for the node when --entrypoint is not provided [default: 127.0.0.1]"),
+                )
                 .arg(
                     Arg::with_name("num_nodes")
                         .short("N")
@@ -98,6 +117,16 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .about("Send stop request to a node")
                 .setting(AppSettings::DisableVersion)
                 .arg(
+                    Arg::with_name("entrypoint")
+                        .short("n")
+                        .long("entrypoint")
+                        .value_name("HOST:PORT")
+                        .takes_value(true)
+                        .required(true)
+                        .validator(solana_net_utils::is_host_port)
+                        .help("Rendezvous with the cluster at this entry point"),
+                )
+                .arg(
                     Arg::with_name("node_pubkey")
                         .index(1)
                         .required(true)
@@ -108,23 +137,14 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         )
         .get_matches();
 
-    if let Some(addr) = matches.value_of("entrypoint") {
-        entrypoint_addr = solana_netutil::parse_host_port(addr).unwrap_or_else(|e| {
-            eprintln!("failed to parse entrypoint address: {}", e);
-            exit(1);
-        });
-    }
-
-    let gossip_addr = {
-        let mut addr = socketaddr_any!();
-        addr.set_ip(
-            solana_netutil::get_public_ip_addr(&entrypoint_addr).unwrap_or_else(|err| {
-                eprintln!("failed to contact {}: {}", entrypoint_addr, err);
+    fn parse_entrypoint(matches: &ArgMatches) -> Option<SocketAddr> {
+        matches.value_of("entrypoint").map(|entrypoint| {
+            solana_net_utils::parse_host_port(entrypoint).unwrap_or_else(|e| {
+                eprintln!("failed to parse entrypoint address: {}", e);
                 exit(1);
-            }),
-        );
-        Some(addr)
-    };
+            })
+        })
+    }
 
     match matches.subcommand() {
         ("spy", Some(matches)) => {
@@ -142,13 +162,39 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .value_of("node_pubkey")
                 .map(|pubkey_str| pubkey_str.parse::<Pubkey>().unwrap());
 
-            let (nodes, _replicators) = discover(
-                &entrypoint_addr,
+            let entrypoint_addr = parse_entrypoint(&matches);
+
+            let gossip_host = if let Some(entrypoint_addr) = entrypoint_addr {
+                solana_net_utils::get_public_ip_addr(&entrypoint_addr).unwrap_or_else(|err| {
+                    eprintln!(
+                        "Failed to contact cluster entrypoint {}: {}",
+                        entrypoint_addr, err
+                    );
+                    exit(1);
+                })
+            } else {
+                solana_net_utils::parse_host(matches.value_of("gossip_host").unwrap_or("127.0.0.1"))
+                    .unwrap_or_else(|err| {
+                        eprintln!("Error: {}", err);
+                        exit(1);
+                    })
+            };
+
+            let gossip_addr = SocketAddr::new(
+                gossip_host,
+                value_t!(matches, "gossip_port", u16).unwrap_or_else(|_| {
+                    solana_net_utils::find_available_port_in_range((0, 1))
+                        .expect("unable to find an available gossip port")
+                }),
+            );
+
+            let (nodes, _archivers) = discover(
+                entrypoint_addr.as_ref(),
                 num_nodes,
                 timeout,
                 pubkey,
                 None,
-                gossip_addr.as_ref(),
+                Some(&gossip_addr),
             )?;
 
             if timeout.is_some() {
@@ -184,42 +230,52 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             }
         }
         ("get-rpc-url", Some(matches)) => {
+            let entrypoint_addr = parse_entrypoint(&matches);
             let timeout = value_t_or_exit!(matches, "timeout", u64);
-            let (nodes, _replicators) = discover(
-                &entrypoint_addr,
+            let (nodes, _archivers) = discover(
+                entrypoint_addr.as_ref(),
                 Some(1),
                 Some(timeout),
                 None,
-                Some(entrypoint_addr.ip()),
-                gossip_addr.as_ref(),
+                entrypoint_addr.as_ref(),
+                None,
             )?;
 
-            let rpc_addr = nodes
+            let rpc_addrs: Vec<_> = nodes
                 .iter()
-                .filter_map(ContactInfo::valid_client_facing_addr)
-                .map(|addrs| addrs.0)
-                .find(|rpc_addr| rpc_addr.ip() == entrypoint_addr.ip());
+                .filter_map(|contact_info| {
+                    if (matches.is_present("all") || Some(contact_info.gossip) == entrypoint_addr)
+                        && ContactInfo::is_valid_address(&contact_info.rpc)
+                    {
+                        return Some(contact_info.rpc);
+                    }
+                    None
+                })
+                .collect();
 
-            if rpc_addr.is_none() {
+            if rpc_addrs.is_empty() {
                 eprintln!("No RPC URL found");
                 exit(1);
             }
 
-            println!("http://{}", rpc_addr.unwrap());
+            for rpc_addr in rpc_addrs {
+                println!("http://{}", rpc_addr);
+            }
         }
         ("stop", Some(matches)) => {
+            let entrypoint_addr = parse_entrypoint(&matches);
             let pubkey = matches
                 .value_of("node_pubkey")
                 .unwrap()
                 .parse::<Pubkey>()
                 .unwrap();
-            let (nodes, _replicators) = discover(
-                &entrypoint_addr,
+            let (nodes, _archivers) = discover(
+                entrypoint_addr.as_ref(),
                 None,
                 None,
                 Some(pubkey),
                 None,
-                gossip_addr.as_ref(),
+                None,
             )?;
             let node = nodes.iter().find(|x| x.id == pubkey).unwrap();
 

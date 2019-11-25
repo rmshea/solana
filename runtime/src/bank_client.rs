@@ -1,22 +1,27 @@
 use crate::bank::Bank;
-use solana_sdk::account::Account;
-use solana_sdk::client::{AsyncClient, Client, SyncClient};
-use solana_sdk::fee_calculator::FeeCalculator;
-use solana_sdk::hash::Hash;
-use solana_sdk::instruction::Instruction;
-use solana_sdk::message::Message;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
-use solana_sdk::signature::{Keypair, KeypairUtil};
-use solana_sdk::system_instruction;
-use solana_sdk::transaction::{self, Transaction};
-use solana_sdk::transport::{Result, TransportError};
-use std::io;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::thread::{sleep, Builder};
-use std::time::{Duration, Instant};
+use solana_sdk::{
+    account::Account,
+    client::{AsyncClient, Client, SyncClient},
+    commitment_config::CommitmentConfig,
+    fee_calculator::FeeCalculator,
+    hash::Hash,
+    instruction::Instruction,
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, KeypairUtil, Signature},
+    system_instruction,
+    transaction::{self, Transaction},
+    transport::{Result, TransportError},
+};
+use std::{
+    io,
+    sync::{
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex,
+    },
+    thread::{sleep, Builder},
+    time::{Duration, Instant},
+};
 
 pub struct BankClient {
     bank: Arc<Bank>,
@@ -100,11 +105,34 @@ impl SyncClient for BankClient {
         Ok(self.bank.get_account(pubkey))
     }
 
+    fn get_account_with_commitment(
+        &self,
+        pubkey: &Pubkey,
+        _commitment_config: CommitmentConfig,
+    ) -> Result<Option<Account>> {
+        Ok(self.bank.get_account(pubkey))
+    }
+
     fn get_balance(&self, pubkey: &Pubkey) -> Result<u64> {
         Ok(self.bank.get_balance(pubkey))
     }
 
+    fn get_balance_with_commitment(
+        &self,
+        pubkey: &Pubkey,
+        _commitment_config: CommitmentConfig,
+    ) -> Result<u64> {
+        Ok(self.bank.get_balance(pubkey))
+    }
+
     fn get_recent_blockhash(&self) -> Result<(Hash, FeeCalculator)> {
+        Ok(self.bank.last_blockhash_with_fee_calculator())
+    }
+
+    fn get_recent_blockhash_with_commitment(
+        &self,
+        _commitment_config: CommitmentConfig,
+    ) -> Result<(Hash, FeeCalculator)> {
         Ok(self.bank.last_blockhash_with_fee_calculator())
     }
 
@@ -115,11 +143,30 @@ impl SyncClient for BankClient {
         Ok(self.bank.get_signature_status(signature))
     }
 
+    fn get_signature_status_with_commitment(
+        &self,
+        signature: &Signature,
+        _commitment_config: CommitmentConfig,
+    ) -> Result<Option<transaction::Result<()>>> {
+        Ok(self.bank.get_signature_status(signature))
+    }
+
     fn get_slot(&self) -> Result<u64> {
         Ok(self.bank.slot())
     }
 
+    fn get_slot_with_commitment(&self, _commitment_config: CommitmentConfig) -> Result<u64> {
+        Ok(self.bank.slot())
+    }
+
     fn get_transaction_count(&self) -> Result<u64> {
+        Ok(self.bank.transaction_count())
+    }
+
+    fn get_transaction_count_with_commitment(
+        &self,
+        _commitment_config: CommitmentConfig,
+    ) -> Result<u64> {
         Ok(self.bank.transaction_count())
     }
 
@@ -144,10 +191,12 @@ impl SyncClient for BankClient {
                 }
             };
             if now.elapsed().as_secs() > 15 {
-                // TODO: Return a better error.
                 return Err(TransportError::IoError(io::Error::new(
                     io::ErrorKind::Other,
-                    "signature not found",
+                    format!(
+                        "signature not found after {} seconds",
+                        now.elapsed().as_secs()
+                    ),
                 )));
             }
             sleep(Duration::from_millis(250));
@@ -165,10 +214,12 @@ impl SyncClient for BankClient {
                 }
             }
             if now.elapsed().as_secs() > 15 {
-                // TODO: Return a better error.
                 return Err(TransportError::IoError(io::Error::new(
                     io::ErrorKind::Other,
-                    "signature not found",
+                    format!(
+                        "signature not found after {} seconds",
+                        now.elapsed().as_secs()
+                    ),
                 )));
             }
             sleep(Duration::from_millis(250));
@@ -192,7 +243,11 @@ impl SyncClient for BankClient {
 impl BankClient {
     fn run(bank: &Bank, transaction_receiver: Receiver<Transaction>) {
         while let Ok(tx) = transaction_receiver.recv() {
-            let _ = bank.process_transaction(&tx);
+            let mut transactions = vec![tx];
+            while let Ok(tx) = transaction_receiver.try_recv() {
+                transactions.push(tx);
+            }
+            let _ = bank.process_transactions(&transactions);
         }
     }
 
@@ -219,17 +274,17 @@ impl BankClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::genesis_block::create_genesis_block;
+    use solana_sdk::genesis_config::create_genesis_config;
     use solana_sdk::instruction::AccountMeta;
 
     #[test]
     fn test_bank_client_new_with_keypairs() {
-        let (genesis_block, john_doe_keypair) = create_genesis_block(10_000);
+        let (genesis_config, john_doe_keypair) = create_genesis_config(10_000);
         let john_pubkey = john_doe_keypair.pubkey();
         let jane_doe_keypair = Keypair::new();
         let jane_pubkey = jane_doe_keypair.pubkey();
         let doe_keypairs = vec![&john_doe_keypair, &jane_doe_keypair];
-        let bank = Bank::new(&genesis_block);
+        let bank = Bank::new(&genesis_config);
         let bank_client = BankClient::new(bank);
 
         // Create 2-2 Multisig Transfer instruction.

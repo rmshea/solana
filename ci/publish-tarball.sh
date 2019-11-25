@@ -67,8 +67,11 @@ echo --- Creating tarball
     echo "target: $TARGET"
   ) > solana-release/version.yml
 
+  # Make CHANNEL available to include in the software version information
+  export CHANNEL
+
   source ci/rust-version.sh stable
-  scripts/cargo-install-all.sh +"$rust_stable" solana-release
+  scripts/cargo-install-all.sh +"$rust_stable" --use-move solana-release
 
   # Reduce the Windows archive size until
   # https://github.com/appveyor/ci/issues/2997 is fixed

@@ -9,7 +9,12 @@ set -e
 
 # Prefer possible `cargo build` binaries over PATH binaries
 cd "$(dirname "$0")/"
-PATH=$PWD/target/debug:$PATH
+
+profile=debug
+if [[ -n $NDEBUG ]]; then
+  profile=release
+fi
+PATH=$PWD/target/$profile:$PATH
 
 ok=true
 for program in solana-{drone,genesis,keygen,validator}; do
@@ -59,33 +64,42 @@ if [[ -e $leader_stake_account_keypair ]]; then
 else
   solana-keygen new -o "$leader_stake_account_keypair"
 fi
-solana-keygen new -f -o "$dataDir"/drone-keypair.json
-solana-keygen new -f -o "$dataDir"/leader-storage-account-keypair.json
+faucet_keypair="$dataDir"/faucet-keypair.json
+if [[ -e $faucet_keypair ]]; then
+  echo "Use existing faucet keypair"
+else
+  solana-keygen new -f -o "$faucet_keypair"
+fi
+leader_storage_account_keypair="$dataDir"/leader-storage-account-keypair.json
+if [[ -e $leader_storage_account_keypair ]]; then
+  echo "Use existing leader storage account keypair"
+else
+  solana-keygen new -f -o "$leader_storage_account_keypair"
+fi
 
 solana-genesis \
-  --lamports 1000000000 \
-  --bootstrap-leader-lamports 10000000 \
-  --target-lamports-per-signature 42 \
-  --target-signatures-per-slot 42 \
   --hashes-per-tick sleep \
-  --mint "$dataDir"/drone-keypair.json \
-  --bootstrap-leader-keypair "$dataDir"/leader-keypair.json \
-  --bootstrap-vote-keypair "$dataDir"/leader-vote-account-keypair.json \
-  --bootstrap-stake-keypair "$dataDir"/leader-stake-account-keypair.json \
-  --bootstrap-storage-keypair "$dataDir"/leader-storage-account-keypair.json \
-  --ledger "$ledgerDir"
+  --faucet-pubkey "$dataDir"/faucet-keypair.json \
+  --faucet-lamports 500000000000000000 \
+  --bootstrap-leader-pubkey "$dataDir"/leader-keypair.json \
+  --bootstrap-vote-pubkey "$dataDir"/leader-vote-account-keypair.json \
+  --bootstrap-stake-pubkey "$dataDir"/leader-stake-account-keypair.json \
+  --bootstrap-storage-pubkey "$dataDir"/leader-storage-account-keypair.json \
+  --ledger "$ledgerDir" \
+  --operating-mode development
 
 abort() {
   set +e
   kill "$drone" "$validator"
+  wait "$validator"
 }
 trap abort INT TERM EXIT
 
-solana-drone --keypair "$dataDir"/drone-keypair.json &
+solana-drone --keypair "$dataDir"/faucet-keypair.json &
 drone=$!
 
 args=(
-  --identity "$dataDir"/leader-keypair.json
+  --identity-keypair "$dataDir"/leader-keypair.json
   --storage-keypair "$dataDir"/leader-storage-account-keypair.json
   --voting-keypair "$dataDir"/leader-vote-account-keypair.json
   --ledger "$ledgerDir"
@@ -93,6 +107,9 @@ args=(
   --rpc-port 8899
   --rpc-drone-address 127.0.0.1:9900
   --accounts "$dataDir"/accounts
+  --log -
+  --enable-rpc-exit
+  --init-complete-file "$dataDir"/init-completed
 )
 if [[ -n $blockstreamSocket ]]; then
   args+=(--blockstream "$blockstreamSocket")

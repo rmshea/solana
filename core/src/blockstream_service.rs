@@ -7,9 +7,8 @@ use crate::blockstream::BlockstreamEvents;
 use crate::blockstream::MockBlockstream as Blockstream;
 #[cfg(not(test))]
 use crate::blockstream::SocketBlockstream as Blockstream;
-use crate::blocktree::Blocktree;
 use crate::result::{Error, Result};
-use crate::service::Service;
+use solana_ledger::blocktree::Blocktree;
 use solana_sdk::pubkey::Pubkey;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,12 +87,8 @@ impl BlockstreamService {
         }
         Ok(())
     }
-}
 
-impl Service for BlockstreamService {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         self.t_blockstream.join()
     }
 }
@@ -101,12 +96,12 @@ impl Service for BlockstreamService {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::blocktree::create_new_tmp_ledger;
-    use crate::entry::{create_ticks, Entry};
-    use crate::genesis_utils::{create_genesis_block, GenesisBlockInfo};
+    use crate::genesis_utils::{create_genesis_config, GenesisConfigInfo};
     use bincode::{deserialize, serialize};
     use chrono::{DateTime, FixedOffset};
     use serde_json::Value;
+    use solana_ledger::create_new_tmp_ledger;
+    use solana_ledger::entry::{create_ticks, Entry};
     use solana_sdk::hash::Hash;
     use solana_sdk::signature::{Keypair, KeypairUtil};
     use solana_sdk::system_transaction;
@@ -118,13 +113,13 @@ mod test {
         let ticks_per_slot = 5;
         let leader_pubkey = Pubkey::new_rand();
 
-        // Set up genesis block and blocktree
-        let GenesisBlockInfo {
-            mut genesis_block, ..
-        } = create_genesis_block(1000);
-        genesis_block.ticks_per_slot = ticks_per_slot;
+        // Set up genesis config and blocktree
+        let GenesisConfigInfo {
+            mut genesis_config, ..
+        } = create_genesis_config(1000);
+        genesis_config.ticks_per_slot = ticks_per_slot;
 
-        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
+        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
         let blocktree = Blocktree::open(&ledger_path).unwrap();
 
         // Set up blockstream
@@ -134,20 +129,15 @@ mod test {
         let (slot_full_sender, slot_full_receiver) = channel();
 
         // Create entries - 4 ticks + 1 populated entry + 1 tick
-        let mut entries = create_ticks(4, Hash::default());
+        let mut entries = create_ticks(4, 0, Hash::default());
 
         let keypair = Keypair::new();
         let mut blockhash = entries[3].hash;
-        let tx = system_transaction::create_user_account(
-            &keypair,
-            &keypair.pubkey(),
-            1,
-            Hash::default(),
-        );
+        let tx = system_transaction::transfer(&keypair, &keypair.pubkey(), 1, Hash::default());
         let entry = Entry::new(&mut blockhash, 1, vec![tx]);
         blockhash = entry.hash;
         entries.push(entry);
-        let final_tick = create_ticks(1, blockhash);
+        let final_tick = create_ticks(1, 0, blockhash);
         entries.extend_from_slice(&final_tick);
 
         let expected_entries = entries.clone();
@@ -163,6 +153,7 @@ mod test {
                 true,
                 &Arc::new(Keypair::new()),
                 entries,
+                0,
             )
             .unwrap();
 

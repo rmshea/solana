@@ -1,23 +1,28 @@
 //! The `rpc` module implements the Solana RPC interface.
 
 use crate::{
-    bank_forks::BankForks,
     cluster_info::ClusterInfo,
-    confidence::{BankConfidence, ForkConfidenceCache},
+    commitment::{BlockCommitment, BlockCommitmentCache},
     contact_info::ContactInfo,
     packet::PACKET_DATA_SIZE,
     storage_stage::StorageState,
     validator::ValidatorExit,
-    version::VERSION,
 };
-use bincode::{deserialize, serialize};
+use bincode::serialize;
 use jsonrpc_core::{Error, Metadata, Result};
 use jsonrpc_derive::rpc;
-use solana_client::rpc_request::{RpcEpochInfo, RpcVoteAccountInfo, RpcVoteAccountStatus};
+use solana_client::rpc_request::{
+    Response, RpcConfirmedBlock, RpcContactInfo, RpcEpochInfo, RpcResponseContext, RpcVersionInfo,
+    RpcVoteAccountInfo, RpcVoteAccountStatus,
+};
 use solana_drone::drone::request_airdrop_transaction;
+use solana_ledger::{bank_forks::BankForks, blocktree::Blocktree};
 use solana_runtime::bank::Bank;
 use solana_sdk::{
     account::Account,
+    clock::Slot,
+    commitment_config::{CommitmentConfig, CommitmentLevel},
+    epoch_schedule::EpochSchedule,
     fee_calculator::FeeCalculator,
     hash::Hash,
     inflation::Inflation,
@@ -25,13 +30,20 @@ use solana_sdk::{
     signature::Signature,
     transaction::{self, Transaction},
 };
-use solana_vote_api::vote_state::{VoteState, MAX_LOCKOUT_HISTORY};
+use solana_vote_program::vote_state::{VoteState, MAX_LOCKOUT_HISTORY};
 use std::{
     net::{SocketAddr, UdpSocket},
     sync::{Arc, RwLock},
     thread::sleep,
     time::{Duration, Instant},
 };
+
+type RpcResponse<T> = Result<Response<T>>;
+
+fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
+    let context = RpcResponseContext { slot: bank.slot() };
+    Ok(Response { context, value })
+}
 
 #[derive(Debug, Clone)]
 pub struct JsonRpcConfig {
@@ -51,108 +63,168 @@ impl Default for JsonRpcConfig {
 #[derive(Clone)]
 pub struct JsonRpcRequestProcessor {
     bank_forks: Arc<RwLock<BankForks>>,
-    fork_confidence_cache: Arc<RwLock<ForkConfidenceCache>>,
-    storage_state: StorageState,
+    block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+    blocktree: Arc<Blocktree>,
     config: JsonRpcConfig,
+    storage_state: StorageState,
     validator_exit: Arc<RwLock<Option<ValidatorExit>>>,
 }
 
 impl JsonRpcRequestProcessor {
-    fn bank(&self) -> Arc<Bank> {
-        self.bank_forks.read().unwrap().working_bank()
+    fn bank(&self, commitment: Option<CommitmentConfig>) -> Arc<Bank> {
+        debug!("RPC commitment_config: {:?}", commitment);
+        let r_bank_forks = self.bank_forks.read().unwrap();
+        if commitment.is_some() && commitment.unwrap().commitment == CommitmentLevel::Recent {
+            let bank = r_bank_forks.working_bank();
+            debug!("RPC using working_bank: {:?}", bank.slot());
+            bank
+        } else {
+            let slot = r_bank_forks.root();
+            debug!("RPC using block: {:?}", slot);
+            r_bank_forks.get(slot).cloned().unwrap()
+        }
     }
 
     pub fn new(
-        storage_state: StorageState,
         config: JsonRpcConfig,
         bank_forks: Arc<RwLock<BankForks>>,
-        fork_confidence_cache: Arc<RwLock<ForkConfidenceCache>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        blocktree: Arc<Blocktree>,
+        storage_state: StorageState,
         validator_exit: &Arc<RwLock<Option<ValidatorExit>>>,
     ) -> Self {
         JsonRpcRequestProcessor {
-            bank_forks,
-            fork_confidence_cache,
-            storage_state,
             config,
+            bank_forks,
+            block_commitment_cache,
+            blocktree,
+            storage_state,
             validator_exit: validator_exit.clone(),
         }
     }
 
-    pub fn get_account_info(&self, pubkey: &Pubkey) -> Result<Account> {
-        self.bank()
-            .get_account(&pubkey)
-            .ok_or_else(Error::invalid_request)
+    pub fn get_account_info(
+        &self,
+        pubkey: Result<Pubkey>,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<Option<Account>> {
+        let bank = &*self.bank(commitment);
+        match pubkey {
+            Ok(key) => new_response(bank, bank.get_account(&key)),
+            Err(e) => Err(e),
+        }
     }
 
-    pub fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> Result<u64> {
-        Ok(self.bank().get_minimum_balance_for_rent_exemption(data_len))
-    }
-
-    pub fn get_program_accounts(&self, program_id: &Pubkey) -> Result<Vec<(String, Account)>> {
+    pub fn get_minimum_balance_for_rent_exemption(
+        &self,
+        data_len: usize,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<u64> {
         Ok(self
-            .bank()
+            .bank(commitment)
+            .get_minimum_balance_for_rent_exemption(data_len))
+    }
+
+    pub fn get_program_accounts(
+        &self,
+        program_id: &Pubkey,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<Vec<(String, Account)>> {
+        Ok(self
+            .bank(commitment)
             .get_program_accounts(&program_id)
             .into_iter()
             .map(|(pubkey, account)| (pubkey.to_string(), account))
             .collect())
     }
 
-    pub fn get_inflation(&self) -> Result<Inflation> {
-        Ok(self.bank().inflation())
+    pub fn get_inflation(&self, commitment: Option<CommitmentConfig>) -> Result<Inflation> {
+        Ok(self.bank(commitment).inflation())
     }
 
-    pub fn get_balance(&self, pubkey: &Pubkey) -> u64 {
-        self.bank().get_balance(&pubkey)
+    pub fn get_epoch_schedule(&self) -> Result<EpochSchedule> {
+        // Since epoch schedule data comes from the genesis config, any commitment level should be
+        // fine
+        Ok(*self.bank(None).epoch_schedule())
     }
 
-    fn get_recent_blockhash(&self) -> (String, FeeCalculator) {
-        let (blockhash, fee_calculator) = self.bank().confirmed_last_blockhash();
-        (blockhash.to_string(), fee_calculator)
+    pub fn get_balance(
+        &self,
+        pubkey: Result<Pubkey>,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<u64> {
+        let bank = &*self.bank(commitment);
+        match pubkey {
+            Ok(key) => new_response(bank, bank.get_balance(&key)),
+            Err(e) => Err(e),
+        }
     }
 
-    fn get_block_confidence(&self, block: u64) -> (Option<BankConfidence>, u64) {
-        let r_fork_confidence = self.fork_confidence_cache.read().unwrap();
+    fn get_recent_blockhash(
+        &self,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<(String, FeeCalculator)> {
+        let bank = &*self.bank(commitment);
+        let (blockhash, fee_calculator) = bank.confirmed_last_blockhash();
+        new_response(bank, (blockhash.to_string(), fee_calculator))
+    }
+
+    pub fn confirm_transaction(
+        &self,
+        signature: Result<Signature>,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<bool> {
+        let bank = &*self.bank(commitment);
+        match signature {
+            Err(e) => Err(e),
+            Ok(sig) => {
+                let status = bank.get_signature_confirmation_status(&sig);
+                match status {
+                    Some((_, result)) => new_response(bank, result.is_ok()),
+                    None => new_response(bank, false),
+                }
+            }
+        }
+    }
+
+    fn get_block_commitment(&self, block: Slot) -> (Option<BlockCommitment>, u64) {
+        let r_block_commitment = self.block_commitment_cache.read().unwrap();
         (
-            r_fork_confidence.get_fork_confidence(block).cloned(),
-            r_fork_confidence.total_stake(),
+            r_block_commitment.get_block_commitment(block).cloned(),
+            r_block_commitment.total_stake(),
         )
-    }
-
-    pub fn get_signature_status(&self, signature: Signature) -> Option<transaction::Result<()>> {
-        self.get_signature_confirmation_status(signature)
-            .map(|x| x.1)
-    }
-
-    pub fn get_signature_confirmations(&self, signature: Signature) -> Option<usize> {
-        self.get_signature_confirmation_status(signature)
-            .map(|x| x.0)
     }
 
     pub fn get_signature_confirmation_status(
         &self,
         signature: Signature,
+        commitment: Option<CommitmentConfig>,
     ) -> Option<(usize, transaction::Result<()>)> {
-        self.bank().get_signature_confirmation_status(&signature)
+        self.bank(commitment)
+            .get_signature_confirmation_status(&signature)
     }
 
-    fn get_slot(&self) -> Result<u64> {
-        Ok(self.bank().slot())
+    fn get_slot(&self, commitment: Option<CommitmentConfig>) -> Result<u64> {
+        Ok(self.bank(commitment).slot())
     }
 
-    fn get_slot_leader(&self) -> Result<String> {
-        Ok(self.bank().collector_id().to_string())
+    fn get_slot_leader(&self, commitment: Option<CommitmentConfig>) -> Result<String> {
+        Ok(self.bank(commitment).collector_id().to_string())
     }
 
-    fn get_transaction_count(&self) -> Result<u64> {
-        Ok(self.bank().transaction_count() as u64)
+    fn get_transaction_count(&self, commitment: Option<CommitmentConfig>) -> Result<u64> {
+        Ok(self.bank(commitment).transaction_count() as u64)
     }
 
-    fn get_total_supply(&self) -> Result<u64> {
-        Ok(self.bank().capitalization())
+    fn get_total_supply(&self, commitment: Option<CommitmentConfig>) -> Result<u64> {
+        Ok(self.bank(commitment).capitalization())
     }
 
-    fn get_vote_accounts(&self) -> Result<RpcVoteAccountStatus> {
-        let bank = self.bank();
+    fn get_vote_accounts(
+        &self,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<RpcVoteAccountStatus> {
+        let bank = self.bank(commitment);
         let vote_accounts = bank.vote_accounts();
         let epoch_vote_accounts = bank
             .epoch_vote_accounts(bank.get_epoch_and_slot_index(bank.slot()).0)
@@ -206,11 +278,11 @@ impl JsonRpcRequestProcessor {
         ))
     }
 
-    fn get_slots_per_segment(&self) -> Result<u64> {
-        Ok(self.bank().slots_per_segment())
+    fn get_slots_per_segment(&self, commitment: Option<CommitmentConfig>) -> Result<u64> {
+        Ok(self.bank(commitment).slots_per_segment())
     }
 
-    fn get_storage_pubkeys_for_slot(&self, slot: u64) -> Result<Vec<Pubkey>> {
+    fn get_storage_pubkeys_for_slot(&self, slot: Slot) -> Result<Vec<Pubkey>> {
         Ok(self
             .storage_state
             .get_pubkeys_for_slot(slot, &self.bank_forks))
@@ -227,6 +299,10 @@ impl JsonRpcRequestProcessor {
             debug!("validator_exit ignored");
             Ok(false)
         }
+    }
+
+    pub fn get_confirmed_block(&self, slot: Slot) -> Result<Option<RpcConfirmedBlock>> {
+        Ok(self.blocktree.get_confirmed_block(slot).ok())
     }
 }
 
@@ -247,164 +323,235 @@ fn verify_signature(input: &str) -> Result<Signature> {
 pub struct Meta {
     pub request_processor: Arc<RwLock<JsonRpcRequestProcessor>>,
     pub cluster_info: Arc<RwLock<ClusterInfo>>,
-    pub genesis_blockhash: Hash,
+    pub genesis_hash: Hash,
 }
 impl Metadata for Meta {}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RpcContactInfo {
-    /// Pubkey of the node as a base-58 string
-    pub pubkey: String,
-    /// Gossip port
-    pub gossip: Option<SocketAddr>,
-    /// Tpu port
-    pub tpu: Option<SocketAddr>,
-    /// JSON RPC port
-    pub rpc: Option<SocketAddr>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(rename_all = "kebab-case")]
-pub struct RpcVersionInfo {
-    /// The current version of solana-core
-    pub solana_core: String,
-}
 
 #[rpc(server)]
 pub trait RpcSol {
     type Metadata;
 
     #[rpc(meta, name = "confirmTransaction")]
-    fn confirm_transaction(&self, _: Self::Metadata, _: String) -> Result<bool>;
+    fn confirm_transaction(
+        &self,
+        meta: Self::Metadata,
+        signature_str: String,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<bool>;
 
     #[rpc(meta, name = "getAccountInfo")]
-    fn get_account_info(&self, _: Self::Metadata, _: String) -> Result<Account>;
+    fn get_account_info(
+        &self,
+        meta: Self::Metadata,
+        pubkey_str: String,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<Option<Account>>;
 
     #[rpc(meta, name = "getProgramAccounts")]
-    fn get_program_accounts(&self, _: Self::Metadata, _: String) -> Result<Vec<(String, Account)>>;
+    fn get_program_accounts(
+        &self,
+        meta: Self::Metadata,
+        program_id_str: String,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<Vec<(String, Account)>>;
 
     #[rpc(meta, name = "getMinimumBalanceForRentExemption")]
-    fn get_minimum_balance_for_rent_exemption(&self, _: Self::Metadata, _: usize) -> Result<u64>;
+    fn get_minimum_balance_for_rent_exemption(
+        &self,
+        meta: Self::Metadata,
+        data_len: usize,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<u64>;
 
     #[rpc(meta, name = "getInflation")]
-    fn get_inflation(&self, _: Self::Metadata) -> Result<Inflation>;
+    fn get_inflation(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<Inflation>;
+
+    #[rpc(meta, name = "getEpochSchedule")]
+    fn get_epoch_schedule(&self, meta: Self::Metadata) -> Result<EpochSchedule>;
 
     #[rpc(meta, name = "getBalance")]
-    fn get_balance(&self, _: Self::Metadata, _: String) -> Result<u64>;
+    fn get_balance(
+        &self,
+        meta: Self::Metadata,
+        pubkey_str: String,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<u64>;
 
     #[rpc(meta, name = "getClusterNodes")]
-    fn get_cluster_nodes(&self, _: Self::Metadata) -> Result<Vec<RpcContactInfo>>;
+    fn get_cluster_nodes(&self, meta: Self::Metadata) -> Result<Vec<RpcContactInfo>>;
 
     #[rpc(meta, name = "getEpochInfo")]
-    fn get_epoch_info(&self, _: Self::Metadata) -> Result<RpcEpochInfo>;
-
-    #[rpc(meta, name = "getBlockConfidence")]
-    fn get_block_confidence(
+    fn get_epoch_info(
         &self,
-        _: Self::Metadata,
-        _: u64,
-    ) -> Result<(Option<BankConfidence>, u64)>;
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<RpcEpochInfo>;
 
-    #[rpc(meta, name = "getGenesisBlockhash")]
-    fn get_genesis_blockhash(&self, _: Self::Metadata) -> Result<String>;
+    #[rpc(meta, name = "getBlockCommitment")]
+    fn get_block_commitment(
+        &self,
+        meta: Self::Metadata,
+        block: u64,
+    ) -> Result<(Option<BlockCommitment>, u64)>;
+
+    #[rpc(meta, name = "getGenesisHash")]
+    fn get_genesis_hash(&self, meta: Self::Metadata) -> Result<String>;
 
     #[rpc(meta, name = "getLeaderSchedule")]
-    fn get_leader_schedule(&self, _: Self::Metadata) -> Result<Option<Vec<String>>>;
+    fn get_leader_schedule(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<Option<Vec<String>>>;
 
     #[rpc(meta, name = "getRecentBlockhash")]
-    fn get_recent_blockhash(&self, _: Self::Metadata) -> Result<(String, FeeCalculator)>;
+    fn get_recent_blockhash(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<(String, FeeCalculator)>;
 
     #[rpc(meta, name = "getSignatureStatus")]
     fn get_signature_status(
         &self,
-        _: Self::Metadata,
-        _: String,
+        meta: Self::Metadata,
+        signature_str: String,
+        commitment: Option<CommitmentConfig>,
     ) -> Result<Option<transaction::Result<()>>>;
 
     #[rpc(meta, name = "getSlot")]
-    fn get_slot(&self, _: Self::Metadata) -> Result<u64>;
+    fn get_slot(&self, meta: Self::Metadata, commitment: Option<CommitmentConfig>) -> Result<u64>;
 
     #[rpc(meta, name = "getTransactionCount")]
-    fn get_transaction_count(&self, _: Self::Metadata) -> Result<u64>;
+    fn get_transaction_count(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<u64>;
 
     #[rpc(meta, name = "getTotalSupply")]
-    fn get_total_supply(&self, _: Self::Metadata) -> Result<u64>;
+    fn get_total_supply(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<u64>;
 
     #[rpc(meta, name = "requestAirdrop")]
-    fn request_airdrop(&self, _: Self::Metadata, _: String, _: u64) -> Result<String>;
+    fn request_airdrop(
+        &self,
+        meta: Self::Metadata,
+        pubkey_str: String,
+        lamports: u64,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<String>;
 
     #[rpc(meta, name = "sendTransaction")]
-    fn send_transaction(&self, _: Self::Metadata, _: Vec<u8>) -> Result<String>;
+    fn send_transaction(&self, meta: Self::Metadata, data: Vec<u8>) -> Result<String>;
 
     #[rpc(meta, name = "getSlotLeader")]
-    fn get_slot_leader(&self, _: Self::Metadata) -> Result<String>;
+    fn get_slot_leader(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<String>;
 
     #[rpc(meta, name = "getVoteAccounts")]
-    fn get_vote_accounts(&self, _: Self::Metadata) -> Result<RpcVoteAccountStatus>;
+    fn get_vote_accounts(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<RpcVoteAccountStatus>;
 
     #[rpc(meta, name = "getStorageTurnRate")]
-    fn get_storage_turn_rate(&self, _: Self::Metadata) -> Result<u64>;
+    fn get_storage_turn_rate(&self, meta: Self::Metadata) -> Result<u64>;
 
     #[rpc(meta, name = "getStorageTurn")]
-    fn get_storage_turn(&self, _: Self::Metadata) -> Result<(String, u64)>;
+    fn get_storage_turn(&self, meta: Self::Metadata) -> Result<(String, u64)>;
 
     #[rpc(meta, name = "getSlotsPerSegment")]
-    fn get_slots_per_segment(&self, _: Self::Metadata) -> Result<u64>;
+    fn get_slots_per_segment(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<u64>;
 
     #[rpc(meta, name = "getStoragePubkeysForSlot")]
-    fn get_storage_pubkeys_for_slot(&self, _: Self::Metadata, _: u64) -> Result<Vec<Pubkey>>;
+    fn get_storage_pubkeys_for_slot(&self, meta: Self::Metadata, slot: u64) -> Result<Vec<Pubkey>>;
 
     #[rpc(meta, name = "validatorExit")]
-    fn validator_exit(&self, _: Self::Metadata) -> Result<bool>;
+    fn validator_exit(&self, meta: Self::Metadata) -> Result<bool>;
 
     #[rpc(meta, name = "getNumBlocksSinceSignatureConfirmation")]
     fn get_num_blocks_since_signature_confirmation(
         &self,
-        _: Self::Metadata,
-        _: String,
+        meta: Self::Metadata,
+        signature_str: String,
+        commitment: Option<CommitmentConfig>,
     ) -> Result<Option<usize>>;
 
     #[rpc(meta, name = "getSignatureConfirmation")]
     fn get_signature_confirmation(
         &self,
-        _: Self::Metadata,
-        _: String,
+        meta: Self::Metadata,
+        signature_str: String,
+        commitment: Option<CommitmentConfig>,
     ) -> Result<Option<(usize, transaction::Result<()>)>>;
 
     #[rpc(meta, name = "getVersion")]
-    fn get_version(&self, _: Self::Metadata) -> Result<RpcVersionInfo>;
+    fn get_version(&self, meta: Self::Metadata) -> Result<RpcVersionInfo>;
 
     #[rpc(meta, name = "setLogFilter")]
-    fn set_log_filter(&self, _: Self::Metadata, _: String) -> Result<()>;
+    fn set_log_filter(&self, _meta: Self::Metadata, filter: String) -> Result<()>;
+
+    #[rpc(meta, name = "getConfirmedBlock")]
+    fn get_confirmed_block(
+        &self,
+        meta: Self::Metadata,
+        slot: Slot,
+    ) -> Result<Option<RpcConfirmedBlock>>;
 }
 
 pub struct RpcSolImpl;
 impl RpcSol for RpcSolImpl {
     type Metadata = Meta;
 
-    fn confirm_transaction(&self, meta: Self::Metadata, id: String) -> Result<bool> {
+    fn confirm_transaction(
+        &self,
+        meta: Self::Metadata,
+        id: String,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<bool> {
         debug!("confirm_transaction rpc request received: {:?}", id);
-        self.get_signature_status(meta, id).map(|status_option| {
-            if status_option.is_none() {
-                return false;
-            }
-            status_option.unwrap().is_ok()
-        })
-    }
-
-    fn get_account_info(&self, meta: Self::Metadata, id: String) -> Result<Account> {
-        debug!("get_account_info rpc request received: {:?}", id);
-        let pubkey = verify_pubkey(id)?;
+        let signature = verify_signature(&id);
         meta.request_processor
             .read()
             .unwrap()
-            .get_account_info(&pubkey)
+            .confirm_transaction(signature, commitment)
+    }
+
+    fn get_account_info(
+        &self,
+        meta: Self::Metadata,
+        pubkey_str: String,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<Option<Account>> {
+        debug!("get_account_info rpc request received: {:?}", pubkey_str);
+        let pubkey = verify_pubkey(pubkey_str);
+        meta.request_processor
+            .read()
+            .unwrap()
+            .get_account_info(pubkey, commitment)
     }
 
     fn get_minimum_balance_for_rent_exemption(
         &self,
         meta: Self::Metadata,
         data_len: usize,
+        commitment: Option<CommitmentConfig>,
     ) -> Result<u64> {
         debug!(
             "get_minimum_balance_for_rent_exemption rpc request received: {:?}",
@@ -413,36 +560,62 @@ impl RpcSol for RpcSolImpl {
         meta.request_processor
             .read()
             .unwrap()
-            .get_minimum_balance_for_rent_exemption(data_len)
+            .get_minimum_balance_for_rent_exemption(data_len, commitment)
     }
 
     fn get_program_accounts(
         &self,
         meta: Self::Metadata,
-        id: String,
+        program_id_str: String,
+        commitment: Option<CommitmentConfig>,
     ) -> Result<Vec<(String, Account)>> {
-        debug!("get_program_accounts rpc request received: {:?}", id);
-        let program_id = verify_pubkey(id)?;
+        debug!(
+            "get_program_accounts rpc request received: {:?}",
+            program_id_str
+        );
+        let program_id = verify_pubkey(program_id_str)?;
         meta.request_processor
             .read()
             .unwrap()
-            .get_program_accounts(&program_id)
+            .get_program_accounts(&program_id, commitment)
     }
 
-    fn get_inflation(&self, meta: Self::Metadata) -> Result<Inflation> {
+    fn get_inflation(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<Inflation> {
         debug!("get_inflation rpc request received");
         Ok(meta
             .request_processor
             .read()
             .unwrap()
-            .get_inflation()
+            .get_inflation(commitment)
             .unwrap())
     }
 
-    fn get_balance(&self, meta: Self::Metadata, id: String) -> Result<u64> {
-        debug!("get_balance rpc request received: {:?}", id);
-        let pubkey = verify_pubkey(id)?;
-        Ok(meta.request_processor.read().unwrap().get_balance(&pubkey))
+    fn get_epoch_schedule(&self, meta: Self::Metadata) -> Result<EpochSchedule> {
+        debug!("get_epoch_schedule rpc request received");
+        Ok(meta
+            .request_processor
+            .read()
+            .unwrap()
+            .get_epoch_schedule()
+            .unwrap())
+    }
+
+    fn get_balance(
+        &self,
+        meta: Self::Metadata,
+        pubkey_str: String,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<u64> {
+        debug!("get_balance rpc request received: {:?}", pubkey_str);
+        let pubkey = verify_pubkey(pubkey_str);
+        meta.request_processor
+            .read()
+            .unwrap()
+            .get_balance(pubkey, commitment)
     }
 
     fn get_cluster_nodes(&self, meta: Self::Metadata) -> Result<Vec<RpcContactInfo>> {
@@ -472,8 +645,12 @@ impl RpcSol for RpcSolImpl {
             .collect())
     }
 
-    fn get_epoch_info(&self, meta: Self::Metadata) -> Result<RpcEpochInfo> {
-        let bank = meta.request_processor.read().unwrap().bank();
+    fn get_epoch_info(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<RpcEpochInfo> {
+        let bank = meta.request_processor.read().unwrap().bank(commitment);
         let epoch_schedule = bank.epoch_schedule();
         let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(bank.slot());
         let slot = bank.slot();
@@ -485,27 +662,31 @@ impl RpcSol for RpcSolImpl {
         })
     }
 
-    fn get_block_confidence(
+    fn get_block_commitment(
         &self,
         meta: Self::Metadata,
-        block: u64,
-    ) -> Result<(Option<BankConfidence>, u64)> {
+        block: Slot,
+    ) -> Result<(Option<BlockCommitment>, u64)> {
         Ok(meta
             .request_processor
             .read()
             .unwrap()
-            .get_block_confidence(block))
+            .get_block_commitment(block))
     }
 
-    fn get_genesis_blockhash(&self, meta: Self::Metadata) -> Result<String> {
-        debug!("get_genesis_blockhash rpc request received");
-        Ok(meta.genesis_blockhash.to_string())
+    fn get_genesis_hash(&self, meta: Self::Metadata) -> Result<String> {
+        debug!("get_genesis_hash rpc request received");
+        Ok(meta.genesis_hash.to_string())
     }
 
-    fn get_leader_schedule(&self, meta: Self::Metadata) -> Result<Option<Vec<String>>> {
-        let bank = meta.request_processor.read().unwrap().bank();
+    fn get_leader_schedule(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<Option<Vec<String>>> {
+        let bank = meta.request_processor.read().unwrap().bank(commitment);
         Ok(
-            crate::leader_schedule_utils::leader_schedule(bank.epoch(), &bank).map(
+            solana_ledger::leader_schedule_utils::leader_schedule(bank.epoch(), &bank).map(
                 |leader_schedule| {
                     leader_schedule
                         .get_slot_leaders()
@@ -517,66 +698,97 @@ impl RpcSol for RpcSolImpl {
         )
     }
 
-    fn get_recent_blockhash(&self, meta: Self::Metadata) -> Result<(String, FeeCalculator)> {
+    fn get_recent_blockhash(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> RpcResponse<(String, FeeCalculator)> {
         debug!("get_recent_blockhash rpc request received");
-        Ok(meta
-            .request_processor
+        meta.request_processor
             .read()
             .unwrap()
-            .get_recent_blockhash())
+            .get_recent_blockhash(commitment)
     }
 
     fn get_signature_status(
         &self,
         meta: Self::Metadata,
-        id: String,
+        signature_str: String,
+        commitment: Option<CommitmentConfig>,
     ) -> Result<Option<transaction::Result<()>>> {
-        self.get_signature_confirmation(meta, id)
+        self.get_signature_confirmation(meta, signature_str, commitment)
             .map(|res| res.map(|x| x.1))
     }
 
-    fn get_slot(&self, meta: Self::Metadata) -> Result<u64> {
-        meta.request_processor.read().unwrap().get_slot()
+    fn get_slot(&self, meta: Self::Metadata, commitment: Option<CommitmentConfig>) -> Result<u64> {
+        meta.request_processor.read().unwrap().get_slot(commitment)
     }
 
     fn get_num_blocks_since_signature_confirmation(
         &self,
         meta: Self::Metadata,
-        id: String,
+        signature_str: String,
+        commitment: Option<CommitmentConfig>,
     ) -> Result<Option<usize>> {
-        self.get_signature_confirmation(meta, id)
+        self.get_signature_confirmation(meta, signature_str, commitment)
             .map(|res| res.map(|x| x.0))
     }
 
     fn get_signature_confirmation(
         &self,
         meta: Self::Metadata,
-        id: String,
+        signature_str: String,
+        commitment: Option<CommitmentConfig>,
     ) -> Result<Option<(usize, transaction::Result<()>)>> {
-        debug!("get_signature_confirmation rpc request received: {:?}", id);
-        let signature = verify_signature(&id)?;
+        debug!(
+            "get_signature_confirmation rpc request received: {:?}",
+            signature_str
+        );
+        let signature = verify_signature(&signature_str)?;
         Ok(meta
             .request_processor
             .read()
             .unwrap()
-            .get_signature_confirmation_status(signature))
+            .get_signature_confirmation_status(signature, commitment))
     }
 
-    fn get_transaction_count(&self, meta: Self::Metadata) -> Result<u64> {
+    fn get_transaction_count(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<u64> {
         debug!("get_transaction_count rpc request received");
         meta.request_processor
             .read()
             .unwrap()
-            .get_transaction_count()
+            .get_transaction_count(commitment)
     }
 
-    fn get_total_supply(&self, meta: Self::Metadata) -> Result<u64> {
+    fn get_total_supply(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<u64> {
         debug!("get_total_supply rpc request received");
-        meta.request_processor.read().unwrap().get_total_supply()
+        meta.request_processor
+            .read()
+            .unwrap()
+            .get_total_supply(commitment)
     }
 
-    fn request_airdrop(&self, meta: Self::Metadata, id: String, lamports: u64) -> Result<String> {
-        trace!("request_airdrop id={} lamports={}", id, lamports);
+    fn request_airdrop(
+        &self,
+        meta: Self::Metadata,
+        pubkey_str: String,
+        lamports: u64,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<String> {
+        trace!(
+            "request_airdrop id={} lamports={} commitment: {:?}",
+            pubkey_str,
+            lamports,
+            &commitment
+        );
 
         let drone_addr = meta
             .request_processor
@@ -585,13 +797,13 @@ impl RpcSol for RpcSolImpl {
             .config
             .drone_addr
             .ok_or_else(Error::invalid_request)?;
-        let pubkey = verify_pubkey(id)?;
+        let pubkey = verify_pubkey(pubkey_str)?;
 
         let blockhash = meta
             .request_processor
             .read()
             .unwrap()
-            .bank()
+            .bank(commitment.clone())
             .confirmed_last_blockhash()
             .0;
         let transaction = request_airdrop_transaction(&drone_addr, &pubkey, lamports, blockhash)
@@ -617,17 +829,22 @@ impl RpcSol for RpcSolImpl {
         let signature = transaction.signatures[0];
         let now = Instant::now();
         let mut signature_status;
+        let signature_timeout = match &commitment {
+            Some(config) if config.commitment == CommitmentLevel::Recent => 5,
+            _ => 30,
+        };
         loop {
             signature_status = meta
                 .request_processor
                 .read()
                 .unwrap()
-                .get_signature_status(signature);
+                .get_signature_confirmation_status(signature, commitment.clone())
+                .map(|x| x.1);
 
             if signature_status == Some(Ok(())) {
                 info!("airdrop signature ok");
                 return Ok(signature.to_string());
-            } else if now.elapsed().as_secs() > 5 {
+            } else if now.elapsed().as_secs() > signature_timeout {
                 info!("airdrop signature timeout");
                 return Err(Error::internal_error());
             }
@@ -636,10 +853,6 @@ impl RpcSol for RpcSolImpl {
     }
 
     fn send_transaction(&self, meta: Self::Metadata, data: Vec<u8>) -> Result<String> {
-        let tx: Transaction = deserialize(&data).map_err(|err| {
-            info!("send_transaction: deserialize error: {:?}", err);
-            Error::invalid_request()
-        })?;
         if data.len() >= PACKET_DATA_SIZE {
             info!(
                 "send_transaction: transaction too large: {} bytes (max: {} bytes)",
@@ -648,6 +861,14 @@ impl RpcSol for RpcSolImpl {
             );
             return Err(Error::invalid_request());
         }
+        let tx: Transaction = bincode::config()
+            .limit(PACKET_DATA_SIZE as u64)
+            .deserialize(&data)
+            .map_err(|err| {
+                info!("send_transaction: deserialize error: {:?}", err);
+                Error::invalid_request()
+            })?;
+
         let transactions_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
         let tpu_addr = get_tpu_addr(&meta.cluster_info)?;
         trace!("send_transaction: leader is {:?}", &tpu_addr);
@@ -666,12 +887,26 @@ impl RpcSol for RpcSolImpl {
         Ok(signature)
     }
 
-    fn get_slot_leader(&self, meta: Self::Metadata) -> Result<String> {
-        meta.request_processor.read().unwrap().get_slot_leader()
+    fn get_slot_leader(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<String> {
+        meta.request_processor
+            .read()
+            .unwrap()
+            .get_slot_leader(commitment)
     }
 
-    fn get_vote_accounts(&self, meta: Self::Metadata) -> Result<RpcVoteAccountStatus> {
-        meta.request_processor.read().unwrap().get_vote_accounts()
+    fn get_vote_accounts(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<RpcVoteAccountStatus> {
+        meta.request_processor
+            .read()
+            .unwrap()
+            .get_vote_accounts(commitment)
     }
 
     fn get_storage_turn_rate(&self, meta: Self::Metadata) -> Result<u64> {
@@ -685,14 +920,22 @@ impl RpcSol for RpcSolImpl {
         meta.request_processor.read().unwrap().get_storage_turn()
     }
 
-    fn get_slots_per_segment(&self, meta: Self::Metadata) -> Result<u64> {
+    fn get_slots_per_segment(
+        &self,
+        meta: Self::Metadata,
+        commitment: Option<CommitmentConfig>,
+    ) -> Result<u64> {
         meta.request_processor
             .read()
             .unwrap()
-            .get_slots_per_segment()
+            .get_slots_per_segment(commitment)
     }
 
-    fn get_storage_pubkeys_for_slot(&self, meta: Self::Metadata, slot: u64) -> Result<Vec<Pubkey>> {
+    fn get_storage_pubkeys_for_slot(
+        &self,
+        meta: Self::Metadata,
+        slot: Slot,
+    ) -> Result<Vec<Pubkey>> {
         meta.request_processor
             .read()
             .unwrap()
@@ -705,13 +948,24 @@ impl RpcSol for RpcSolImpl {
 
     fn get_version(&self, _: Self::Metadata) -> Result<RpcVersionInfo> {
         Ok(RpcVersionInfo {
-            solana_core: VERSION.to_string(),
+            solana_core: solana_clap_utils::version!().to_string(),
         })
     }
 
-    fn set_log_filter(&self, _: Self::Metadata, filter: String) -> Result<()> {
+    fn set_log_filter(&self, _meta: Self::Metadata, filter: String) -> Result<()> {
         solana_logger::setup_with_filter(&filter);
         Ok(())
+    }
+
+    fn get_confirmed_block(
+        &self,
+        meta: Self::Metadata,
+        slot: Slot,
+    ) -> Result<Option<RpcConfirmedBlock>> {
+        meta.request_processor
+            .read()
+            .unwrap()
+            .get_confirmed_block(slot)
     }
 }
 
@@ -720,9 +974,11 @@ pub mod tests {
     use super::*;
     use crate::{
         contact_info::ContactInfo,
-        genesis_utils::{create_genesis_block, GenesisBlockInfo},
+        genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        replay_stage::tests::create_test_transactions_and_populate_blocktree,
     };
     use jsonrpc_core::{MetaIoHandler, Output, Response, Value};
+    use solana_ledger::get_tmp_ledger_path;
     use solana_sdk::{
         fee_calculator::DEFAULT_BURN_PERCENT,
         hash::{hash, Hash},
@@ -746,20 +1002,39 @@ pub mod tests {
         blockhash: Hash,
         alice: Keypair,
         leader_pubkey: Pubkey,
-        fork_confidence_cache: Arc<RwLock<ForkConfidenceCache>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        confirmed_block_signatures: Vec<Signature>,
     }
 
     fn start_rpc_handler_with_tx(pubkey: &Pubkey) -> RpcHandler {
         let (bank_forks, alice) = new_bank_forks();
         let bank = bank_forks.read().unwrap().working_bank();
 
-        let confidence_slot0 = BankConfidence::new([8; MAX_LOCKOUT_HISTORY]);
-        let confidence_slot1 = BankConfidence::new([9; MAX_LOCKOUT_HISTORY]);
-        let mut bank_confidence: HashMap<u64, BankConfidence> = HashMap::new();
-        bank_confidence.entry(0).or_insert(confidence_slot0.clone());
-        bank_confidence.entry(1).or_insert(confidence_slot1.clone());
-        let fork_confidence_cache =
-            Arc::new(RwLock::new(ForkConfidenceCache::new(bank_confidence, 42)));
+        let commitment_slot0 = BlockCommitment::new([8; MAX_LOCKOUT_HISTORY]);
+        let commitment_slot1 = BlockCommitment::new([9; MAX_LOCKOUT_HISTORY]);
+        let mut block_commitment: HashMap<u64, BlockCommitment> = HashMap::new();
+        block_commitment
+            .entry(0)
+            .or_insert(commitment_slot0.clone());
+        block_commitment
+            .entry(1)
+            .or_insert(commitment_slot1.clone());
+        let block_commitment_cache =
+            Arc::new(RwLock::new(BlockCommitmentCache::new(block_commitment, 42)));
+        let ledger_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&ledger_path).unwrap();
+        let blocktree = Arc::new(blocktree);
+
+        let keypair1 = Keypair::new();
+        let keypair2 = Keypair::new();
+        let keypair3 = Keypair::new();
+        bank.transfer(4, &alice, &keypair2.pubkey()).unwrap();
+        let confirmed_block_signatures = create_test_transactions_and_populate_blocktree(
+            vec![&alice, &keypair1, &keypair2, &keypair3],
+            0,
+            bank.clone(),
+            blocktree.clone(),
+        );
 
         let leader_pubkey = *bank.collector_id();
         let exit = Arc::new(AtomicBool::new(false));
@@ -773,10 +1048,11 @@ pub mod tests {
         let _ = bank.process_transaction(&tx);
 
         let request_processor = Arc::new(RwLock::new(JsonRpcRequestProcessor::new(
-            StorageState::default(),
             JsonRpcConfig::default(),
             bank_forks,
-            fork_confidence_cache.clone(),
+            block_commitment_cache.clone(),
+            blocktree,
+            StorageState::default(),
             &validator_exit,
         )));
         let cluster_info = Arc::new(RwLock::new(ClusterInfo::new_with_invalid_keypair(
@@ -797,7 +1073,7 @@ pub mod tests {
         let meta = Meta {
             request_processor,
             cluster_info,
-            genesis_blockhash: Hash::default(),
+            genesis_hash: Hash::default(),
         };
         RpcHandler {
             io,
@@ -806,7 +1082,8 @@ pub mod tests {
             blockhash,
             alice,
             leader_pubkey,
-            fork_confidence_cache,
+            block_commitment_cache,
+            confirmed_block_signatures,
         }
     }
 
@@ -817,12 +1094,15 @@ pub mod tests {
         let validator_exit = create_validator_exit(&exit);
         let (bank_forks, alice) = new_bank_forks();
         let bank = bank_forks.read().unwrap().working_bank();
-        let fork_confidence_cache = Arc::new(RwLock::new(ForkConfidenceCache::default()));
+        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
+        let ledger_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&ledger_path).unwrap();
         let request_processor = JsonRpcRequestProcessor::new(
-            StorageState::default(),
             JsonRpcConfig::default(),
             bank_forks,
-            fork_confidence_cache,
+            block_commitment_cache,
+            Arc::new(blocktree),
+            StorageState::default(),
             &validator_exit,
         );
         thread::spawn(move || {
@@ -832,7 +1112,7 @@ pub mod tests {
         })
         .join()
         .unwrap();
-        assert_eq!(request_processor.get_transaction_count().unwrap(), 1);
+        assert_eq!(request_processor.get_transaction_count(None).unwrap(), 1);
     }
 
     #[test]
@@ -845,10 +1125,15 @@ pub mod tests {
             bob_pubkey
         );
         let res = io.handle_request_sync(&req, meta);
-        let expected = format!(r#"{{"jsonrpc":"2.0","result":20,"id":1}}"#);
-        let expected: Response =
-            serde_json::from_str(&expected).expect("expected response deserialization");
-        let result: Response = serde_json::from_str(&res.expect("actual response"))
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "context":{"slot":0},
+                "value":20,
+                },
+            "id": 1,
+        });
+        let result = serde_json::from_str::<Value>(&res.expect("actual response"))
             .expect("actual response deserialization");
         assert_eq!(expected, result);
     }
@@ -905,7 +1190,7 @@ pub mod tests {
 
         let req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getTransactionCount"}}"#);
         let res = io.handle_request_sync(&req, meta);
-        let expected = format!(r#"{{"jsonrpc":"2.0","result":1,"id":1}}"#);
+        let expected = format!(r#"{{"jsonrpc":"2.0","result":3,"id":1}}"#);
         let expected: Response =
             serde_json::from_str(&expected).expect("expected response deserialization");
         let result: Response = serde_json::from_str(&res.expect("actual response"))
@@ -992,6 +1277,28 @@ pub mod tests {
     }
 
     #[test]
+    fn test_rpc_get_epoch_schedule() {
+        let bob_pubkey = Pubkey::new_rand();
+        let RpcHandler { io, meta, bank, .. } = start_rpc_handler_with_tx(&bob_pubkey);
+
+        let req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getEpochSchedule"}}"#);
+        let rep = io.handle_request_sync(&req, meta);
+        let res: Response = serde_json::from_str(&rep.expect("actual response"))
+            .expect("actual response deserialization");
+
+        let epoch_schedule: EpochSchedule = if let Response::Single(res) = res {
+            if let Output::Success(res) = res {
+                serde_json::from_value(res.result).unwrap()
+            } else {
+                panic!("Expected success");
+            }
+        } else {
+            panic!("Expected single response");
+        };
+        assert_eq!(epoch_schedule, *bank.epoch_schedule());
+    }
+
+    #[test]
     fn test_rpc_get_account_info() {
         let bob_pubkey = Pubkey::new_rand();
         let RpcHandler { io, meta, .. } = start_rpc_handler_with_tx(&bob_pubkey);
@@ -1001,19 +1308,22 @@ pub mod tests {
             bob_pubkey
         );
         let res = io.handle_request_sync(&req, meta);
-        let expected = r#"{
-            "jsonrpc":"2.0",
-            "result":{
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "context":{"slot":0},
+                "value":{
                 "owner": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
                 "lamports": 20,
                 "data": [],
                 "executable": false,
                 "rent_epoch": 0
             },
-            "id":1}
-        "#;
+                },
+            "id": 1,
+        });
         let expected: Response =
-            serde_json::from_str(&expected).expect("expected response deserialization");
+            serde_json::from_value(expected).expect("expected response deserialization");
         let result: Response = serde_json::from_str(&res.expect("actual response"))
             .expect("actual response deserialization");
         assert_eq!(expected, result);
@@ -1077,9 +1387,16 @@ pub mod tests {
             tx.signatures[0]
         );
         let res = io.handle_request_sync(&req, meta);
-        let expected = format!(r#"{{"jsonrpc":"2.0","result":true,"id":1}}"#);
+        let expected = json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "context":{"slot":0},
+                "value":true,
+                },
+            "id": 1,
+        });
         let expected: Response =
-            serde_json::from_str(&expected).expect("expected response deserialization");
+            serde_json::from_value(expected).expect("expected response deserialization");
         let result: Response = serde_json::from_str(&res.expect("actual response"))
             .expect("actual response deserialization");
         assert_eq!(expected, result);
@@ -1169,14 +1486,16 @@ pub mod tests {
         let res = io.handle_request_sync(&req, meta);
         let expected = json!({
             "jsonrpc": "2.0",
-            "result": [ blockhash.to_string(), {
+            "result": {
+            "context":{"slot":0},
+            "value":[ blockhash.to_string(), {
                 "burnPercent": DEFAULT_BURN_PERCENT,
                 "lamportsPerSignature": 0,
                 "maxLamportsPerSignature": 0,
                 "minLamportsPerSignature": 0,
                 "targetLamportsPerSignature": 0,
                 "targetSignaturesPerSlot": 0
-            }],
+            }]},
             "id": 1
         });
         let expected: Response =
@@ -1210,7 +1529,9 @@ pub mod tests {
     fn test_rpc_send_bad_tx() {
         let exit = Arc::new(AtomicBool::new(false));
         let validator_exit = create_validator_exit(&exit);
-        let fork_confidence_cache = Arc::new(RwLock::new(ForkConfidenceCache::default()));
+        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
+        let ledger_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&ledger_path).unwrap();
 
         let mut io = MetaIoHandler::default();
         let rpc = RpcSolImpl;
@@ -1218,10 +1539,11 @@ pub mod tests {
         let meta = Meta {
             request_processor: {
                 let request_processor = JsonRpcRequestProcessor::new(
-                    StorageState::default(),
                     JsonRpcConfig::default(),
                     new_bank_forks().0,
-                    fork_confidence_cache,
+                    block_commitment_cache,
+                    Arc::new(blocktree),
+                    StorageState::default(),
                     &validator_exit,
                 );
                 Arc::new(RwLock::new(request_processor))
@@ -1229,7 +1551,7 @@ pub mod tests {
             cluster_info: Arc::new(RwLock::new(ClusterInfo::new_with_invalid_keypair(
                 ContactInfo::default(),
             ))),
-            genesis_blockhash: Hash::default(),
+            genesis_hash: Hash::default(),
         };
 
         let req =
@@ -1281,16 +1603,16 @@ pub mod tests {
     }
 
     fn new_bank_forks() -> (Arc<RwLock<BankForks>>, Keypair) {
-        let GenesisBlockInfo {
-            mut genesis_block,
+        let GenesisConfigInfo {
+            mut genesis_config,
             mint_keypair,
             ..
-        } = create_genesis_block(TEST_MINT_LAMPORTS);
+        } = create_genesis_config(TEST_MINT_LAMPORTS);
 
-        genesis_block.rent_calculator.lamports_per_byte_year = 50;
-        genesis_block.rent_calculator.exemption_threshold = 2.0;
+        genesis_config.rent.lamports_per_byte_year = 50;
+        genesis_config.rent.exemption_threshold = 2.0;
 
-        let bank = Bank::new(&genesis_block);
+        let bank = Bank::new(&genesis_config);
         (
             Arc::new(RwLock::new(BankForks::new(bank.slot(), bank))),
             mint_keypair,
@@ -1308,12 +1630,15 @@ pub mod tests {
     fn test_rpc_request_processor_config_default_trait_validator_exit_fails() {
         let exit = Arc::new(AtomicBool::new(false));
         let validator_exit = create_validator_exit(&exit);
-        let fork_confidence_cache = Arc::new(RwLock::new(ForkConfidenceCache::default()));
+        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
+        let ledger_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&ledger_path).unwrap();
         let request_processor = JsonRpcRequestProcessor::new(
-            StorageState::default(),
             JsonRpcConfig::default(),
             new_bank_forks().0,
-            fork_confidence_cache,
+            block_commitment_cache,
+            Arc::new(blocktree),
+            StorageState::default(),
             &validator_exit,
         );
         assert_eq!(request_processor.validator_exit(), Ok(false));
@@ -1324,14 +1649,17 @@ pub mod tests {
     fn test_rpc_request_processor_allow_validator_exit_config() {
         let exit = Arc::new(AtomicBool::new(false));
         let validator_exit = create_validator_exit(&exit);
-        let fork_confidence_cache = Arc::new(RwLock::new(ForkConfidenceCache::default()));
+        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
+        let ledger_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&ledger_path).unwrap();
         let mut config = JsonRpcConfig::default();
         config.enable_validator_exit = true;
         let request_processor = JsonRpcRequestProcessor::new(
-            StorageState::default(),
             config,
             new_bank_forks().0,
-            fork_confidence_cache,
+            block_commitment_cache,
+            Arc::new(blocktree),
+            StorageState::default(),
             &validator_exit,
         );
         assert_eq!(request_processor.validator_exit(), Ok(true));
@@ -1348,7 +1676,7 @@ pub mod tests {
         let expected = json!({
             "jsonrpc": "2.0",
             "result": {
-                "solana-core": VERSION
+                "solana-core": solana_clap_utils::version!().to_string()
             },
             "id": 1
         });
@@ -1360,53 +1688,60 @@ pub mod tests {
     }
 
     #[test]
-    fn test_rpc_processor_get_block_confidence() {
+    fn test_rpc_processor_get_block_commitment() {
         let exit = Arc::new(AtomicBool::new(false));
         let validator_exit = create_validator_exit(&exit);
-        let confidence_slot0 = BankConfidence::new([8; MAX_LOCKOUT_HISTORY]);
-        let confidence_slot1 = BankConfidence::new([9; MAX_LOCKOUT_HISTORY]);
-        let mut bank_confidence: HashMap<u64, BankConfidence> = HashMap::new();
-        bank_confidence.entry(0).or_insert(confidence_slot0.clone());
-        bank_confidence.entry(1).or_insert(confidence_slot1.clone());
-        let fork_confidence_cache =
-            Arc::new(RwLock::new(ForkConfidenceCache::new(bank_confidence, 42)));
+        let commitment_slot0 = BlockCommitment::new([8; MAX_LOCKOUT_HISTORY]);
+        let commitment_slot1 = BlockCommitment::new([9; MAX_LOCKOUT_HISTORY]);
+        let mut block_commitment: HashMap<u64, BlockCommitment> = HashMap::new();
+        block_commitment
+            .entry(0)
+            .or_insert(commitment_slot0.clone());
+        block_commitment
+            .entry(1)
+            .or_insert(commitment_slot1.clone());
+        let block_commitment_cache =
+            Arc::new(RwLock::new(BlockCommitmentCache::new(block_commitment, 42)));
+        let ledger_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&ledger_path).unwrap();
 
         let mut config = JsonRpcConfig::default();
         config.enable_validator_exit = true;
         let request_processor = JsonRpcRequestProcessor::new(
-            StorageState::default(),
             config,
             new_bank_forks().0,
-            fork_confidence_cache,
+            block_commitment_cache,
+            Arc::new(blocktree),
+            StorageState::default(),
             &validator_exit,
         );
         assert_eq!(
-            request_processor.get_block_confidence(0),
-            (Some(confidence_slot0), 42)
+            request_processor.get_block_commitment(0),
+            (Some(commitment_slot0), 42)
         );
         assert_eq!(
-            request_processor.get_block_confidence(1),
-            (Some(confidence_slot1), 42)
+            request_processor.get_block_commitment(1),
+            (Some(commitment_slot1), 42)
         );
-        assert_eq!(request_processor.get_block_confidence(2), (None, 42));
+        assert_eq!(request_processor.get_block_commitment(2), (None, 42));
     }
 
     #[test]
-    fn test_rpc_get_block_confidence() {
+    fn test_rpc_get_block_commitment() {
         let bob_pubkey = Pubkey::new_rand();
         let RpcHandler {
             io,
             meta,
-            fork_confidence_cache,
+            block_commitment_cache,
             ..
         } = start_rpc_handler_with_tx(&bob_pubkey);
 
         let req =
-            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getBlockConfidence","params":[0]}}"#);
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getBlockCommitment","params":[0]}}"#);
         let res = io.handle_request_sync(&req, meta.clone());
         let result: Response = serde_json::from_str(&res.expect("actual response"))
             .expect("actual response deserialization");
-        let (confidence, total_staked): (Option<BankConfidence>, u64) =
+        let (commitment, total_staked): (Option<BlockCommitment>, u64) =
             if let Response::Single(res) = result {
                 if let Output::Success(res) = res {
                     serde_json::from_value(res.result).unwrap()
@@ -1417,21 +1752,21 @@ pub mod tests {
                 panic!("Expected single response");
             };
         assert_eq!(
-            confidence,
-            fork_confidence_cache
+            commitment,
+            block_commitment_cache
                 .read()
                 .unwrap()
-                .get_fork_confidence(0)
+                .get_block_commitment(0)
                 .cloned()
         );
         assert_eq!(total_staked, 42);
 
         let req =
-            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getBlockConfidence","params":[2]}}"#);
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getBlockCommitment","params":[2]}}"#);
         let res = io.handle_request_sync(&req, meta);
         let result: Response = serde_json::from_str(&res.expect("actual response"))
             .expect("actual response deserialization");
-        let (confidence, total_staked): (Option<BankConfidence>, u64) =
+        let (commitment, total_staked): (Option<BlockCommitment>, u64) =
             if let Response::Single(res) = result {
                 if let Output::Success(res) = res {
                     serde_json::from_value(res.result).unwrap()
@@ -1441,7 +1776,46 @@ pub mod tests {
             } else {
                 panic!("Expected single response");
             };
-        assert_eq!(confidence, None);
+        assert_eq!(commitment, None);
         assert_eq!(total_staked, 42);
+    }
+
+    #[test]
+    fn test_get_confirmed_block() {
+        let bob_pubkey = Pubkey::new_rand();
+        let RpcHandler {
+            io,
+            meta,
+            confirmed_block_signatures,
+            blockhash,
+            ..
+        } = start_rpc_handler_with_tx(&bob_pubkey);
+
+        let req =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"method":"getConfirmedBlock","params":[0]}}"#);
+        let res = io.handle_request_sync(&req, meta);
+        let result: Value = serde_json::from_str(&res.expect("actual response"))
+            .expect("actual response deserialization");
+        let confirmed_block: Option<RpcConfirmedBlock> =
+            serde_json::from_value(result["result"].clone()).unwrap();
+        let confirmed_block = confirmed_block.unwrap();
+        assert_eq!(confirmed_block.transactions.len(), 3);
+
+        for (transaction, result) in confirmed_block.transactions.into_iter() {
+            if transaction.signatures[0] == confirmed_block_signatures[0] {
+                assert_eq!(transaction.message.recent_blockhash, blockhash);
+                assert_eq!(result.unwrap().status, Ok(()));
+            } else if transaction.signatures[0] == confirmed_block_signatures[1] {
+                assert_eq!(
+                    result.unwrap().status,
+                    Err(TransactionError::InstructionError(
+                        0,
+                        InstructionError::CustomError(1)
+                    ))
+                );
+            } else {
+                assert_eq!(result, None);
+            }
+        }
     }
 }

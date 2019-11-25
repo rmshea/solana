@@ -1,5 +1,3 @@
-use solana_metrics;
-
 use crate::cli::Config;
 use log::*;
 use rayon::prelude::*;
@@ -7,18 +5,19 @@ use solana_client::perf_utils::{sample_txs, SampleStats};
 use solana_core::gen_keys::GenKeys;
 use solana_drone::drone::request_airdrop_transaction;
 #[cfg(feature = "move")]
-use solana_librapay_api::{create_genesis, upload_mint_program, upload_payment_program};
+use solana_librapay_api::{create_genesis, upload_mint_script, upload_payment_script};
 use solana_measure::measure::Measure;
-use solana_metrics::datapoint_debug;
+use solana_metrics::{self, datapoint_debug};
 use solana_sdk::{
     client::Client,
     clock::{DEFAULT_TICKS_PER_SECOND, DEFAULT_TICKS_PER_SLOT, MAX_PROCESSING_AGE},
+    commitment_config::CommitmentConfig,
     fee_calculator::FeeCalculator,
     hash::Hash,
     pubkey::Pubkey,
     signature::{Keypair, KeypairUtil},
     system_instruction, system_transaction,
-    timing::{duration_as_ms, duration_as_s, timestamp},
+    timing::{duration_as_ms, duration_as_s, duration_as_us, timestamp},
     transaction::Transaction,
 };
 use std::{
@@ -55,7 +54,7 @@ type LibraKeys = (Keypair, Pubkey, Pubkey, Vec<Keypair>);
 
 fn get_recent_blockhash<T: Client>(client: &T) -> (Hash, FeeCalculator) {
     loop {
-        match client.get_recent_blockhash() {
+        match client.get_recent_blockhash_with_commitment(CommitmentConfig::recent()) {
             Ok((blockhash, fee_calculator)) => return (blockhash, fee_calculator),
             Err(err) => {
                 info!("Couldn't get recent blockhash: {:?}", err);
@@ -158,12 +157,13 @@ where
     let mut reclaim_lamports_back_to_source_account = false;
     let mut i = keypair0_balance;
     let mut blockhash = Hash::default();
-    let mut blockhash_time = Instant::now();
+    let mut blockhash_time;
     while start.elapsed() < duration {
         // ping-pong between source and destination accounts for each loop iteration
         // this seems to be faster than trying to determine the balance of individual
         // accounts
         let len = tx_count as usize;
+        blockhash_time = Instant::now();
         if let Ok((new_blockhash, _fee_calculator)) = client.get_new_blockhash(&blockhash) {
             blockhash = new_blockhash;
         } else {
@@ -173,13 +173,19 @@ where
             sleep(Duration::from_millis(100));
             continue;
         }
-        info!(
-            "Took {} ms for new blockhash",
-            duration_as_ms(&blockhash_time.elapsed())
+        datapoint_debug!(
+            "bench-tps-get_blockhash",
+            ("duration", duration_as_us(&blockhash_time.elapsed()), i64)
         );
+
         blockhash_time = Instant::now();
         let balance = client.get_balance(&id.pubkey()).unwrap_or(0);
         metrics_submit_lamport_balance(balance);
+        datapoint_debug!(
+            "bench-tps-get_balance",
+            ("duration", duration_as_us(&blockhash_time.elapsed()), i64)
+        );
+
         generate_txs(
             &shared_txs,
             &blockhash,
@@ -306,7 +312,7 @@ fn generate_system_txs(
         .par_iter()
         .map(|(from, to)| {
             (
-                system_transaction::create_user_account(from, &to.pubkey(), 1, *blockhash),
+                system_transaction::transfer(from, &to.pubkey(), 1, *blockhash),
                 timestamp(),
             )
         })
@@ -367,7 +373,7 @@ fn generate_txs(
     );
     datapoint_debug!(
         "bench-tps-generate_txs",
-        ("duration", duration_as_ms(&duration), i64)
+        ("duration", duration_as_us(&duration), i64)
     );
 
     let sz = transactions.len() / threads;
@@ -432,7 +438,7 @@ fn do_tx_transfers<T: Client>(
             );
             datapoint_debug!(
                 "bench-tps-do_tx_transfers",
-                ("duration", duration_as_ms(&transfer_start.elapsed()), i64),
+                ("duration", duration_as_us(&transfer_start.elapsed()), i64),
                 ("count", tx_len, i64)
             );
         }
@@ -444,7 +450,11 @@ fn do_tx_transfers<T: Client>(
 
 fn verify_funding_transfer<T: Client>(client: &T, tx: &Transaction, amount: u64) -> bool {
     for a in &tx.message().account_keys[1..] {
-        if client.get_balance(a).unwrap_or(0) >= amount {
+        if client
+            .get_balance_with_commitment(a, CommitmentConfig::recent())
+            .unwrap_or(0)
+            >= amount
+        {
             return true;
         }
     }
@@ -634,15 +644,22 @@ pub fn airdrop_lamports<T: Client>(
         let (blockhash, _fee_calculator) = get_recent_blockhash(client);
         match request_airdrop_transaction(&drone_addr, &id.pubkey(), airdrop_amount, blockhash) {
             Ok(transaction) => {
-                let signature = client.async_send_transaction(transaction).unwrap();
-                client
-                    .poll_for_signature_confirmation(&signature, 1)
-                    .unwrap_or_else(|_| {
+                let mut tries = 0;
+                loop {
+                    tries += 1;
+                    let signature = client.async_send_transaction(transaction.clone()).unwrap();
+                    let result = client.poll_for_signature_confirmation(&signature, 1);
+
+                    if result.is_ok() {
+                        break;
+                    }
+                    if tries >= 5 {
                         panic!(
-                            "Error requesting airdrop: to addr: {:?} amount: {}",
-                            drone_addr, airdrop_amount
+                            "Error requesting airdrop: to addr: {:?} amount: {} {:?}",
+                            drone_addr, airdrop_amount, result
                         )
-                    })
+                    }
+                }
             }
             Err(err) => {
                 panic!(
@@ -652,10 +669,12 @@ pub fn airdrop_lamports<T: Client>(
             }
         };
 
-        let current_balance = client.get_balance(&id.pubkey()).unwrap_or_else(|e| {
-            info!("airdrop error {}", e);
-            starting_balance
-        });
+        let current_balance = client
+            .get_balance_with_commitment(&id.pubkey(), CommitmentConfig::recent())
+            .unwrap_or_else(|e| {
+                info!("airdrop error {}", e);
+                starting_balance
+            });
         info!("current balance {}...", current_balance);
 
         metrics_submit_lamport_balance(current_balance);
@@ -770,62 +789,62 @@ fn fund_move_keys<T: Client>(
     total: u64,
     libra_pay_program_id: &Pubkey,
     libra_mint_program_id: &Pubkey,
-    libra_mint_key: &Keypair,
+    libra_genesis_key: &Keypair,
 ) {
     let (mut blockhash, _fee_calculator) = get_recent_blockhash(client);
 
     info!("creating the libra funding account..");
     let libra_funding_key = Keypair::new();
-    let tx = librapay_transaction::create_account(
-        funding_key,
-        &libra_funding_key.pubkey(),
-        1,
-        blockhash,
-    );
-    client.send_message(&[funding_key], tx.message).unwrap();
+    let tx = librapay_transaction::create_account(funding_key, &libra_funding_key, 1, blockhash);
+    client
+        .send_message(&[funding_key, &libra_funding_key], tx.message)
+        .unwrap();
 
     info!("minting to funding keypair");
     let tx = librapay_transaction::mint_tokens(
         &libra_mint_program_id,
         funding_key,
-        libra_mint_key,
+        libra_genesis_key,
         &libra_funding_key.pubkey(),
         total,
         blockhash,
     );
     client
-        .send_message(&[funding_key, libra_mint_key], tx.message)
+        .send_message(&[funding_key, libra_genesis_key], tx.message)
         .unwrap();
 
     info!("creating {} move accounts...", keypairs.len());
-    let create_len = 8;
+    let total_len = keypairs.len();
+    let create_len = 5;
     let mut funding_time = Measure::start("funding_time");
     for (i, keys) in keypairs.chunks(create_len).enumerate() {
-        if client.get_balance(&keys[0].pubkey()).unwrap_or(0) > 0 {
+        if client
+            .get_balance_with_commitment(&keys[0].pubkey(), CommitmentConfig::recent())
+            .unwrap_or(0)
+            > 0
+        {
             // already created these accounts.
             break;
         }
 
-        let pubkeys: Vec<_> = keys.iter().map(|k| k.pubkey()).collect();
-        let tx = librapay_transaction::create_accounts(funding_key, &pubkeys, 1, blockhash);
-
+        let keypairs: Vec<_> = keys.iter().map(|k| k).collect();
+        let tx = librapay_transaction::create_accounts(funding_key, &keypairs, 1, blockhash);
         let ser_size = bincode::serialized_size(&tx).unwrap();
-
-        client.send_message(&[funding_key], tx.message).unwrap();
+        let mut keys = vec![funding_key];
+        keys.extend(&keypairs);
+        client.send_message(&keys, tx.message).unwrap();
 
         if i % 10 == 0 {
             info!(
-                "size: {} created {} accounts of {}",
-                ser_size,
+                "created {} accounts of {} (size {})",
                 i,
-                (keypairs.len() / create_len),
+                total_len / create_len,
+                ser_size,
             );
         }
     }
-    funding_time.stop();
-    info!("funding accounts {}ms", funding_time.as_ms());
 
-    const NUM_FUNDING_KEYS: usize = 4;
+    const NUM_FUNDING_KEYS: usize = 10;
     let funding_keys: Vec<_> = (0..NUM_FUNDING_KEYS).map(|_| Keypair::new()).collect();
     let pubkey_amounts: Vec<_> = funding_keys
         .iter()
@@ -839,7 +858,9 @@ fn fund_move_keys<T: Client>(
     client.send_message(&[funding_key], tx.message).unwrap();
     let mut balance = 0;
     for _ in 0..20 {
-        if let Ok(balance_) = client.get_balance(&funding_keys[0].pubkey()) {
+        if let Ok(balance_) = client
+            .get_balance_with_commitment(&funding_keys[0].pubkey(), CommitmentConfig::recent())
+        {
             if balance_ > 0 {
                 balance = balance_;
                 break;
@@ -848,19 +869,21 @@ fn fund_move_keys<T: Client>(
         sleep(Duration::from_millis(100));
     }
     assert!(balance > 0);
-    info!("funded multiple funding accounts.. {:?}", balance);
+    info!(
+        "funded multiple funding accounts with {:?} lanports",
+        balance
+    );
 
     let libra_funding_keys: Vec<_> = (0..NUM_FUNDING_KEYS).map(|_| Keypair::new()).collect();
     for (i, key) in libra_funding_keys.iter().enumerate() {
-        let tx =
-            librapay_transaction::create_account(&funding_keys[i], &key.pubkey(), 1, blockhash);
+        let tx = librapay_transaction::create_account(&funding_keys[i], &key, 1, blockhash);
         client
-            .send_message(&[&funding_keys[i]], tx.message)
+            .send_message(&[&funding_keys[i], &key], tx.message)
             .unwrap();
 
         let tx = librapay_transaction::transfer(
             libra_pay_program_id,
-            &libra_mint_key.pubkey(),
+            &libra_genesis_key.pubkey(),
             &funding_keys[i],
             &libra_funding_key,
             &key.pubkey(),
@@ -880,7 +903,7 @@ fn fund_move_keys<T: Client>(
         for (j, key) in keys.iter().enumerate() {
             let tx = librapay_transaction::transfer(
                 libra_pay_program_id,
-                &libra_mint_key.pubkey(),
+                &libra_genesis_key.pubkey(),
                 &funding_keys[j],
                 &libra_funding_keys[j],
                 &key.pubkey(),
@@ -893,7 +916,6 @@ fn fund_move_keys<T: Client>(
                 .expect("create_account in generate_and_fund_keypairs");
         }
 
-        info!("sent... checking balance {}", i);
         for (j, key) in keys.iter().enumerate() {
             let mut times = 0;
             loop {
@@ -911,11 +933,16 @@ fn fund_move_keys<T: Client>(
             }
         }
 
-        info!("funded: {} of {}", i, keypairs.len() / NUM_FUNDING_KEYS);
+        info!(
+            "funded group {} of {}",
+            i + 1,
+            keypairs.len() / NUM_FUNDING_KEYS
+        );
         blockhash = get_recent_blockhash(client).0;
     }
 
-    info!("done funding keys..");
+    funding_time.stop();
+    info!("done funding keys, took {} ms", funding_time.as_ms());
 }
 
 pub fn generate_and_fund_keypairs<T: Client>(
@@ -965,8 +992,8 @@ pub fn generate_and_fund_keypairs<T: Client>(
         {
             if use_move {
                 let libra_genesis_keypair = create_genesis(&funding_key, client, 10_000_000);
-                let libra_mint_program_id = upload_mint_program(&funding_key, client);
-                let libra_pay_program_id = upload_payment_program(&funding_key, client);
+                let libra_mint_program_id = upload_mint_script(&funding_key, client);
+                let libra_pay_program_id = upload_payment_script(&funding_key, client);
 
                 // Generate another set of keypairs for move accounts.
                 // Still fund the solana ones which will be used for fees.
@@ -1017,7 +1044,7 @@ mod tests {
     use solana_runtime::bank_client::BankClient;
     use solana_sdk::client::SyncClient;
     use solana_sdk::fee_calculator::FeeCalculator;
-    use solana_sdk::genesis_block::create_genesis_block;
+    use solana_sdk::genesis_config::create_genesis_config;
 
     #[test]
     fn test_switch_directions() {
@@ -1036,8 +1063,8 @@ mod tests {
 
     #[test]
     fn test_bench_tps_bank_client() {
-        let (genesis_block, id) = create_genesis_block(10_000);
-        let bank = Bank::new(&genesis_block);
+        let (genesis_config, id) = create_genesis_config(10_000);
+        let bank = Bank::new(&genesis_config);
         let clients = vec![BankClient::new(bank)];
 
         let mut config = Config::default();
@@ -1054,8 +1081,8 @@ mod tests {
 
     #[test]
     fn test_bench_tps_fund_keys() {
-        let (genesis_block, id) = create_genesis_block(10_000);
-        let bank = Bank::new(&genesis_block);
+        let (genesis_config, id) = create_genesis_config(10_000);
+        let bank = Bank::new(&genesis_config);
         let client = BankClient::new(bank);
         let tx_count = 10;
         let lamports = 20;
@@ -1064,16 +1091,21 @@ mod tests {
             generate_and_fund_keypairs(&client, None, &id, tx_count, lamports, false).unwrap();
 
         for kp in &keypairs {
-            assert_eq!(client.get_balance(&kp.pubkey()).unwrap(), lamports);
+            assert_eq!(
+                client
+                    .get_balance_with_commitment(&kp.pubkey(), CommitmentConfig::recent())
+                    .unwrap(),
+                lamports
+            );
         }
     }
 
     #[test]
     fn test_bench_tps_fund_keys_with_fees() {
-        let (mut genesis_block, id) = create_genesis_block(10_000);
+        let (mut genesis_config, id) = create_genesis_config(10_000);
         let fee_calculator = FeeCalculator::new(11, 0);
-        genesis_block.fee_calculator = fee_calculator;
-        let bank = Bank::new(&genesis_block);
+        genesis_config.fee_calculator = fee_calculator;
+        let bank = Bank::new(&genesis_config);
         let client = BankClient::new(bank);
         let tx_count = 10;
         let lamports = 20;
@@ -1082,7 +1114,7 @@ mod tests {
             generate_and_fund_keypairs(&client, None, &id, tx_count, lamports, false).unwrap();
 
         let max_fee = client
-            .get_recent_blockhash()
+            .get_recent_blockhash_with_commitment(CommitmentConfig::recent())
             .unwrap()
             .1
             .max_lamports_per_signature;

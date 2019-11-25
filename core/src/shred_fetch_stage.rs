@@ -1,10 +1,9 @@
 //! The `shred_fetch_stage` pulls shreds from UDP sockets and sends it to a channel.
 
-use crate::cuda_runtime::PinnedVec;
-use crate::packet::Packet;
-use crate::recycler::Recycler;
-use crate::service::Service;
+use crate::packet::{Packet, PacketsRecycler};
 use crate::streamer::{self, PacketReceiver, PacketSender};
+use solana_perf::cuda_runtime::PinnedVec;
+use solana_perf::recycler::Recycler;
 use std::net::UdpSocket;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::channel;
@@ -67,7 +66,8 @@ impl ShredFetchStage {
         sender: &PacketSender,
         exit: &Arc<AtomicBool>,
     ) -> Self {
-        let recycler = Recycler::default();
+        let recycler: PacketsRecycler = Recycler::warmed(100, 1024);
+
         let tvu_threads = sockets.into_iter().map(|socket| {
             streamer::receiver(
                 socket,
@@ -103,12 +103,8 @@ impl ShredFetchStage {
 
         Self { thread_hdls }
     }
-}
 
-impl Service for ShredFetchStage {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         for thread_hdl in self.thread_hdls {
             thread_hdl.join()?;
         }

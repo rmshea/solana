@@ -4,15 +4,15 @@ extern crate solana_core;
 extern crate test;
 
 use log::*;
-use solana_core::bank_forks::BankForks;
 use solana_core::cluster_info::{ClusterInfo, Node};
 use solana_core::contact_info::ContactInfo;
-use solana_core::genesis_utils::{create_genesis_block, GenesisBlockInfo};
-use solana_core::leader_schedule_cache::LeaderScheduleCache;
+use solana_core::genesis_utils::{create_genesis_config, GenesisConfigInfo};
 use solana_core::packet::to_packets_chunked;
 use solana_core::retransmit_stage::retransmitter;
-use solana_core::test_tx::test_tx;
+use solana_ledger::bank_forks::BankForks;
+use solana_ledger::leader_schedule_cache::LeaderScheduleCache;
 use solana_measure::measure::Measure;
+use solana_perf::test_tx::test_tx;
 use solana_runtime::bank::Bank;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::timing::timestamp;
@@ -47,8 +47,8 @@ fn bench_retransmitter(bencher: &mut Bencher) {
     let peer_sockets = Arc::new(peer_sockets);
     let cluster_info = Arc::new(RwLock::new(cluster_info));
 
-    let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(100_000);
-    let bank0 = Bank::new(&genesis_block);
+    let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(100_000);
+    let bank0 = Bank::new(&genesis_config);
     let bank_forks = BankForks::new(0, bank0);
     let bank = bank_forks.working_bank();
     let bank_forks = Arc::new(RwLock::new(bank_forks));

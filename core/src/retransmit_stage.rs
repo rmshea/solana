@@ -1,19 +1,21 @@
-//! The `retransmit_stage` retransmits blobs between validators
+//! The `retransmit_stage` retransmits shreds between validators
 
 use crate::{
-    bank_forks::BankForks,
-    blocktree::{Blocktree, CompletedSlotsReceiver},
     cluster_info::{compute_retransmit_peers, ClusterInfo, DATA_PLANE_FANOUT},
-    leader_schedule_cache::LeaderScheduleCache,
+    packet::Packets,
+    partition_cfg::PartitionCfg,
     repair_service::RepairStrategy,
     result::{Error, Result},
-    service::Service,
-    staking_utils,
     streamer::PacketReceiver,
     window_service::{should_retransmit_and_persist, WindowService},
 };
-use rand::SeedableRng;
-use rand_chacha::ChaChaRng;
+use crossbeam_channel::Receiver as CrossbeamReceiver;
+use solana_ledger::{
+    bank_forks::BankForks,
+    blocktree::{Blocktree, CompletedSlotsReceiver},
+    leader_schedule_cache::LeaderScheduleCache,
+    staking_utils,
+};
 use solana_measure::measure::Measure;
 use solana_metrics::inc_new_counter_error;
 use solana_sdk::epoch_schedule::EpochSchedule;
@@ -65,21 +67,30 @@ fn retransmit(
         .unwrap()
         .sorted_retransmit_peers_and_stakes(stakes.as_ref());
     let me = cluster_info.read().unwrap().my_data().clone();
+    let mut discard_total = 0;
+    let mut repair_total = 0;
     let mut retransmit_total = 0;
     let mut compute_turbine_peers_total = 0;
     for mut packets in packet_v {
         for packet in packets.packets.iter_mut() {
             // skip discarded packets and repair packets
-            if packet.meta.discard || packet.meta.repair {
+            if packet.meta.discard {
                 total_packets -= 1;
+                discard_total += 1;
                 continue;
             }
+            if packet.meta.repair {
+                total_packets -= 1;
+                repair_total += 1;
+                continue;
+            }
+
             let mut compute_turbine_peers = Measure::start("turbine_start");
             let (my_index, mut shuffled_stakes_and_index) = ClusterInfo::shuffle_peers_and_index(
                 &me.id,
                 &peers,
                 &stakes_and_index,
-                ChaChaRng::from_seed(packet.meta.seed),
+                packet.meta.seed,
             );
             peers_len = cmp::max(peers_len, shuffled_stakes_and_index.len());
             shuffled_stakes_and_index.remove(my_index);
@@ -124,6 +135,8 @@ fn retransmit(
         ("total_packets", total_packets as i64, i64),
         ("retransmit_total", retransmit_total as i64, i64),
         ("compute_turbine", compute_turbine_peers_total as i64, i64),
+        ("repair_total", i64::from(repair_total), i64),
+        ("discard_total", i64::from(discard_total), i64),
     );
     Ok(())
 }
@@ -131,11 +144,11 @@ fn retransmit(
 /// Service to retransmit messages from the leader or layer 1 to relevant peer nodes.
 /// See `cluster_info` for network layer definitions.
 /// # Arguments
-/// * `sock` - Socket to read from.  Read timeout is set to 1.
-/// * `exit` - Boolean to signal system exit.
+/// * `sockets` - Sockets to read from.
+/// * `bank_forks` - The BankForks structure
+/// * `leader_schedule_cache` - The leader schedule to verify shreds
 /// * `cluster_info` - This structure needs to be updated and populated by the bank and via gossip.
-/// * `recycler` - Blob recycler.
-/// * `r` - Receive channel for blobs to be retransmitted to all the layer 1 nodes.
+/// * `r` - Receive channel for shreds to be retransmitted to all the layer 1 nodes.
 pub fn retransmitter(
     sockets: Arc<Vec<UdpSocket>>,
     bank_forks: Arc<RwLock<BankForks>>,
@@ -195,10 +208,12 @@ impl RetransmitStage {
         cluster_info: &Arc<RwLock<ClusterInfo>>,
         retransmit_sockets: Arc<Vec<UdpSocket>>,
         repair_socket: Arc<UdpSocket>,
-        fetch_stage_receiver: PacketReceiver,
+        verified_receiver: CrossbeamReceiver<Vec<Packets>>,
         exit: &Arc<AtomicBool>,
         completed_slots_receiver: CompletedSlotsReceiver,
         epoch_schedule: EpochSchedule,
+        cfg: Option<PartitionCfg>,
+        shred_version: u16,
     ) -> Self {
         let (retransmit_sender, retransmit_receiver) = channel();
 
@@ -220,20 +235,26 @@ impl RetransmitStage {
         let window_service = WindowService::new(
             blocktree,
             cluster_info.clone(),
-            fetch_stage_receiver,
+            verified_receiver,
             retransmit_sender,
             repair_socket,
             exit,
             repair_strategy,
             &leader_schedule_cache.clone(),
             move |id, shred, working_bank, last_root| {
-                should_retransmit_and_persist(
+                let is_connected = cfg
+                    .as_ref()
+                    .map(|x| x.is_connected(&working_bank, &leader_schedule_cache, shred))
+                    .unwrap_or(true);
+                let rv = should_retransmit_and_persist(
                     shred,
                     working_bank,
                     &leader_schedule_cache,
                     id,
                     last_root,
-                )
+                    shred_version,
+                );
+                rv && is_connected
             },
         );
 
@@ -243,12 +264,8 @@ impl RetransmitStage {
             window_service,
         }
     }
-}
 
-impl Service for RetransmitStage {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         for thread_hdl in self.thread_hdls {
             thread_hdl.join()?;
         }
@@ -260,25 +277,25 @@ impl Service for RetransmitStage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocktree::create_new_tmp_ledger;
-    use crate::blocktree_processor::{process_blocktree, ProcessOptions};
     use crate::contact_info::ContactInfo;
-    use crate::genesis_utils::{create_genesis_block, GenesisBlockInfo};
-    use crate::packet::{Meta, Packet, Packets};
-    use solana_netutil::find_available_port_in_range;
+    use crate::genesis_utils::{create_genesis_config, GenesisConfigInfo};
+    use crate::packet::{self, Meta, Packet, Packets};
+    use solana_ledger::blocktree_processor::{process_blocktree, ProcessOptions};
+    use solana_ledger::create_new_tmp_ledger;
+    use solana_net_utils::find_available_port_in_range;
     use solana_sdk::pubkey::Pubkey;
 
     #[test]
     fn test_skip_repair() {
-        let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(123);
-        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(123);
+        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
         let blocktree = Blocktree::open(&ledger_path).unwrap();
         let opts = ProcessOptions {
             full_leader_cache: true,
             ..ProcessOptions::default()
         };
         let (bank_forks, _, cached_leader_schedule) =
-            process_blocktree(&genesis_block, &blocktree, None, opts).unwrap();
+            process_blocktree(&genesis_config, &blocktree, None, opts).unwrap();
         let leader_schedule_cache = Arc::new(cached_leader_schedule);
         let bank_forks = Arc::new(RwLock::new(bank_forks));
 
@@ -314,7 +331,7 @@ mod tests {
         // it should send this over the sockets.
         retransmit_sender.send(packets).unwrap();
         let mut packets = Packets::new(vec![]);
-        packets.recv_from(&me_retransmit).unwrap();
+        packet::recv_from(&mut packets, &me_retransmit).unwrap();
         assert_eq!(packets.packets.len(), 1);
         assert_eq!(packets.packets[0].meta.repair, false);
 
@@ -330,7 +347,7 @@ mod tests {
         let packets = Packets::new(vec![repair, Packet::default()]);
         retransmit_sender.send(packets).unwrap();
         let mut packets = Packets::new(vec![]);
-        packets.recv_from(&me_retransmit).unwrap();
+        packet::recv_from(&mut packets, &me_retransmit).unwrap();
         assert_eq!(packets.packets.len(), 1);
         assert_eq!(packets.packets[0].meta.repair, false);
     }

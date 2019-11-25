@@ -1,8 +1,8 @@
 // Module used by validators to approve storage mining proofs in parallel using the GPU
 
-use crate::blocktree::Blocktree;
 use crate::chacha::{CHACHA_BLOCK_SIZE, CHACHA_KEY_SIZE};
-use crate::perf_libs;
+use solana_ledger::blocktree::Blocktree;
+use solana_perf::perf_libs;
 use solana_sdk::hash::Hash;
 use std::io;
 use std::mem::size_of;
@@ -113,10 +113,10 @@ pub fn chacha_cbc_encrypt_file_many_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocktree::get_tmp_ledger_path;
+    use crate::archiver::sample_file;
     use crate::chacha::chacha_cbc_encrypt_ledger;
-    use crate::entry::create_ticks;
-    use crate::replicator::sample_file;
+    use solana_ledger::entry::create_ticks;
+    use solana_ledger::get_tmp_ledger_path;
     use solana_sdk::clock::DEFAULT_SLOTS_PER_SEGMENT;
     use solana_sdk::signature::{Keypair, KeypairUtil};
     use std::fs::{remove_dir_all, remove_file};
@@ -131,9 +131,8 @@ mod tests {
         }
 
         let slots_per_segment = 32;
-        let entries = create_ticks(slots_per_segment, Hash::default());
-        let ledger_dir = "test_encrypt_file_many_keys_single";
-        let ledger_path = get_tmp_ledger_path(ledger_dir);
+        let entries = create_ticks(slots_per_segment, 0, Hash::default());
+        let ledger_path = get_tmp_ledger_path!();
         let ticks_per_slot = 16;
         let blocktree = Arc::new(Blocktree::open(&ledger_path).unwrap());
 
@@ -147,6 +146,7 @@ mod tests {
                 true,
                 &Arc::new(Keypair::new()),
                 entries,
+                0,
             )
             .unwrap();
 
@@ -193,10 +193,9 @@ mod tests {
             return;
         }
 
-        let ledger_dir = "test_encrypt_file_many_keys_multiple";
-        let ledger_path = get_tmp_ledger_path(ledger_dir);
+        let ledger_path = get_tmp_ledger_path!();
         let ticks_per_slot = 90;
-        let entries = create_ticks(2 * ticks_per_slot, Hash::default());
+        let entries = create_ticks(2 * ticks_per_slot, 0, Hash::default());
         let blocktree = Arc::new(Blocktree::open(&ledger_path).unwrap());
         blocktree
             .write_entries(
@@ -208,6 +207,7 @@ mod tests {
                 true,
                 &Arc::new(Keypair::new()),
                 entries,
+                0,
             )
             .unwrap();
 
@@ -265,8 +265,7 @@ mod tests {
         }
 
         let mut keys = hex!("abc123");
-        let ledger_dir = "test_encrypt_file_many_keys_bad_key_length";
-        let ledger_path = get_tmp_ledger_path(ledger_dir);
+        let ledger_path = get_tmp_ledger_path!();
         let samples = [0];
         let blocktree = Arc::new(Blocktree::open(&ledger_path).unwrap());
         assert!(chacha_cbc_encrypt_file_many_keys(

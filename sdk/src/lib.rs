@@ -10,11 +10,12 @@ pub mod instruction;
 pub mod instruction_processor_utils;
 pub mod loader_instruction;
 pub mod message;
+pub mod move_loader;
 pub mod native_loader;
 pub mod native_token;
 pub mod poh_config;
 pub mod pubkey;
-pub mod rent_calculator;
+pub mod rent;
 pub mod rpc_port;
 pub mod short_vec;
 pub mod slot_hashes;
@@ -34,7 +35,9 @@ pub mod bank_hash;
 #[cfg(not(feature = "program"))]
 pub mod client;
 #[cfg(not(feature = "program"))]
-pub mod genesis_block;
+pub mod commitment_config;
+#[cfg(not(feature = "program"))]
+pub mod genesis_config;
 #[cfg(not(feature = "program"))]
 pub mod packet;
 #[cfg(not(feature = "program"))]
@@ -48,3 +51,6 @@ pub mod transport;
 
 #[macro_use]
 extern crate serde_derive;
+pub extern crate bs58;
+pub extern crate lazy_static;
+extern crate log as logger;

@@ -21,15 +21,13 @@ declare print_free_tree=(
   'core/src'
   'drone/src'
   'metrics/src'
-  'netutil/src'
+  'net-utils/src'
   'runtime/src'
   'sdk/bpf/rust/rust-utils'
   'sdk/src'
   'programs/bpf/rust'
-  'programs/stake_api/src'
-  'programs/stake_program/src'
-  'programs/vote_api/src'
-  'programs/vote_program/src'
+  'programs/stake/src'
+  'programs/vote/src'
 )
 
 if _ git --no-pager grep -n --max-depth=0 "${prints[@]/#/-e }" -- "${print_free_tree[@]}"; then
@@ -44,3 +42,27 @@ fi
 if _ git --no-pager grep -n 'Default::default()' -- '*.rs'; then
     exit 1
 fi
+
+
+# Github Issues should be used to track outstanding work items instead of
+# marking up the code
+#
+# Ref: https://github.com/solana-labs/solana/issues/6474
+#
+# shellcheck disable=1001
+declare useGithubIssueInsteadOf=(
+  X\XX
+  T\BD
+  F\IXME
+  #T\ODO  # TODO: Disable TODOs once all other TODOs are purged
+)
+
+if _ git --no-pager grep -n --max-depth=0 "${useGithubIssueInsteadOf[@]/#/-e }" -- '*.rs' '*.sh' '*.md'; then
+    exit 1
+fi
+
+# TODO: Remove this `git grep` once TODOs are banned above
+#       (this command is only used to highlight the current offenders)
+_ git --no-pager grep -n --max-depth=0 "-e TODO" -- '*.rs' '*.sh' '*.md' || true
+echo "^^^ +++"
+# END TODO

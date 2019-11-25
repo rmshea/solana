@@ -1,17 +1,15 @@
 //! The `pubsub` module implements a threaded subscription service on client RPC request
 
-use crate::bank_forks::BankForks;
 use core::hash::Hash;
 use jsonrpc_core::futures::Future;
-use jsonrpc_pubsub::typed::Sink;
-use jsonrpc_pubsub::SubscriptionId;
+use jsonrpc_pubsub::{typed::Sink, SubscriptionId};
 use serde::Serialize;
+use solana_ledger::bank_forks::BankForks;
 use solana_runtime::bank::Bank;
-use solana_sdk::account::Account;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature;
-use solana_sdk::transaction;
-use solana_vote_api::vote_state::MAX_LOCKOUT_HISTORY;
+use solana_sdk::{
+    account::Account, clock::Slot, pubkey::Pubkey, signature::Signature, transaction,
+};
+use solana_vote_program::vote_state::MAX_LOCKOUT_HISTORY;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -74,7 +72,7 @@ where
 fn check_confirmations_and_notify<K, S, F, N, X>(
     subscriptions: &HashMap<K, HashMap<SubscriptionId, (Sink<S>, Confirmations)>>,
     hashmap_key: &K,
-    current_slot: u64,
+    current_slot: Slot,
     bank_forks: &Arc<RwLock<BankForks>>,
     bank_method: F,
     notify: N,
@@ -169,7 +167,7 @@ impl RpcSubscriptions {
     pub fn check_account(
         &self,
         pubkey: &Pubkey,
-        current_slot: u64,
+        current_slot: Slot,
         bank_forks: &Arc<RwLock<BankForks>>,
     ) {
         let subscriptions = self.account_subscriptions.read().unwrap();
@@ -186,7 +184,7 @@ impl RpcSubscriptions {
     pub fn check_program(
         &self,
         program_id: &Pubkey,
-        current_slot: u64,
+        current_slot: Slot,
         bank_forks: &Arc<RwLock<BankForks>>,
     ) {
         let subscriptions = self.program_subscriptions.write().unwrap();
@@ -203,7 +201,7 @@ impl RpcSubscriptions {
     pub fn check_signature(
         &self,
         signature: &Signature,
-        current_slot: u64,
+        current_slot: Slot,
         bank_forks: &Arc<RwLock<BankForks>>,
     ) {
         let mut subscriptions = self.signature_subscriptions.write().unwrap();
@@ -268,7 +266,7 @@ impl RpcSubscriptions {
 
     /// Notify subscribers of changes to any accounts or new signatures since
     /// the bank's last checkpoint.
-    pub fn notify_subscribers(&self, current_slot: u64, bank_forks: &Arc<RwLock<BankForks>>) {
+    pub fn notify_subscribers(&self, current_slot: Slot, bank_forks: &Arc<RwLock<BankForks>>) {
         let pubkeys: Vec<_> = {
             let subs = self.account_subscriptions.read().unwrap();
             subs.keys().cloned().collect()
@@ -298,31 +296,31 @@ impl RpcSubscriptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::genesis_utils::{create_genesis_block, GenesisBlockInfo};
+    use crate::genesis_utils::{create_genesis_config, GenesisConfigInfo};
     use jsonrpc_pubsub::typed::Subscriber;
-    use solana_budget_api;
+    use solana_budget_program;
     use solana_sdk::signature::{Keypair, KeypairUtil};
     use solana_sdk::system_transaction;
     use tokio::prelude::{Async, Stream};
 
     #[test]
     fn test_check_account_subscribe() {
-        let GenesisBlockInfo {
-            genesis_block,
+        let GenesisConfigInfo {
+            genesis_config,
             mint_keypair,
             ..
-        } = create_genesis_block(100);
-        let bank = Bank::new(&genesis_block);
+        } = create_genesis_config(100);
+        let bank = Bank::new(&genesis_config);
         let blockhash = bank.last_blockhash();
         let bank_forks = Arc::new(RwLock::new(BankForks::new(0, bank)));
         let alice = Keypair::new();
         let tx = system_transaction::create_account(
             &mint_keypair,
-            &alice.pubkey(),
+            &alice,
             blockhash,
             1,
             16,
-            &solana_budget_api::id(),
+            &solana_budget_program::id(),
         );
         bank_forks
             .write()
@@ -348,7 +346,7 @@ mod tests {
         subscriptions.check_account(&alice.pubkey(), 0, &bank_forks);
         let string = transport_receiver.poll();
         if let Async::Ready(Some(response)) = string.unwrap() {
-            let expected = format!(r#"{{"jsonrpc":"2.0","method":"accountNotification","params":{{"result":{{"data":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"executable":false,"lamports":1,"owner":[2,203,81,223,225,24,34,35,203,214,138,130,144,208,35,77,63,16,87,51,47,198,115,123,98,188,19,160,0,0,0,0],"rent_epoch":0}},"subscription":0}}}}"#);
+            let expected = format!(r#"{{"jsonrpc":"2.0","method":"accountNotification","params":{{"result":{{"data":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"executable":false,"lamports":1,"owner":[2,203,81,223,225,24,34,35,203,214,138,130,144,208,35,77,63,16,87,51,47,198,115,123,98,188,19,160,0,0,0,0],"rent_epoch":1}},"subscription":0}}}}"#);
             assert_eq!(expected, response);
         }
 
@@ -362,22 +360,22 @@ mod tests {
 
     #[test]
     fn test_check_program_subscribe() {
-        let GenesisBlockInfo {
-            genesis_block,
+        let GenesisConfigInfo {
+            genesis_config,
             mint_keypair,
             ..
-        } = create_genesis_block(100);
-        let bank = Bank::new(&genesis_block);
+        } = create_genesis_config(100);
+        let bank = Bank::new(&genesis_config);
         let blockhash = bank.last_blockhash();
         let bank_forks = Arc::new(RwLock::new(BankForks::new(0, bank)));
         let alice = Keypair::new();
         let tx = system_transaction::create_account(
             &mint_keypair,
-            &alice.pubkey(),
+            &alice,
             blockhash,
             1,
             16,
-            &solana_budget_api::id(),
+            &solana_budget_program::id(),
         );
         bank_forks
             .write()
@@ -392,18 +390,18 @@ mod tests {
         let sub_id = SubscriptionId::Number(0 as u64);
         let sink = subscriber.assign_id(sub_id.clone()).unwrap();
         let subscriptions = RpcSubscriptions::default();
-        subscriptions.add_program_subscription(&solana_budget_api::id(), None, &sub_id, &sink);
+        subscriptions.add_program_subscription(&solana_budget_program::id(), None, &sub_id, &sink);
 
         assert!(subscriptions
             .program_subscriptions
             .read()
             .unwrap()
-            .contains_key(&solana_budget_api::id()));
+            .contains_key(&solana_budget_program::id()));
 
-        subscriptions.check_program(&solana_budget_api::id(), 0, &bank_forks);
+        subscriptions.check_program(&solana_budget_program::id(), 0, &bank_forks);
         let string = transport_receiver.poll();
         if let Async::Ready(Some(response)) = string.unwrap() {
-            let expected = format!(r#"{{"jsonrpc":"2.0","method":"programNotification","params":{{"result":["{:?}",{{"data":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"executable":false,"lamports":1,"owner":[2,203,81,223,225,24,34,35,203,214,138,130,144,208,35,77,63,16,87,51,47,198,115,123,98,188,19,160,0,0,0,0],"rent_epoch":0}}],"subscription":0}}}}"#, alice.pubkey());
+            let expected = format!(r#"{{"jsonrpc":"2.0","method":"programNotification","params":{{"result":["{:?}",{{"data":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"executable":false,"lamports":1,"owner":[2,203,81,223,225,24,34,35,203,214,138,130,144,208,35,77,63,16,87,51,47,198,115,123,98,188,19,160,0,0,0,0],"rent_epoch":1}}],"subscription":0}}}}"#, alice.pubkey());
             assert_eq!(expected, response);
         }
 
@@ -412,16 +410,16 @@ mod tests {
             .program_subscriptions
             .read()
             .unwrap()
-            .contains_key(&solana_budget_api::id()));
+            .contains_key(&solana_budget_program::id()));
     }
     #[test]
     fn test_check_signature_subscribe() {
-        let GenesisBlockInfo {
-            genesis_block,
+        let GenesisConfigInfo {
+            genesis_config,
             mint_keypair,
             ..
-        } = create_genesis_block(100);
-        let bank = Bank::new(&genesis_block);
+        } = create_genesis_config(100);
+        let bank = Bank::new(&genesis_config);
         let blockhash = bank.last_blockhash();
         let bank_forks = Arc::new(RwLock::new(BankForks::new(0, bank)));
         let alice = Keypair::new();

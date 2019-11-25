@@ -1,4 +1,4 @@
-use clap::{crate_description, crate_name, crate_version, value_t, App, Arg, ArgMatches};
+use clap::{crate_description, crate_name, value_t, App, Arg, ArgMatches};
 use solana_core::gen_keys::GenKeys;
 use solana_drone::drone::DRONE_PORT;
 use solana_sdk::signature::{read_keypair_file, Keypair, KeypairUtil};
@@ -44,10 +44,10 @@ impl Default for Config {
     }
 }
 
-pub fn build_args<'a, 'b>() -> App<'a, 'b> {
+pub fn build_args<'a, 'b>(version: &'b str) -> App<'a, 'b> {
     App::new(crate_name!())
         .about(crate_description!())
-        .version(crate_version!())
+        .version(version)
         .arg(
             Arg::with_name("entrypoint")
                 .short("n")
@@ -166,13 +166,15 @@ pub fn build_args<'a, 'b>() -> App<'a, 'b> {
 pub fn extract_args<'a>(matches: &ArgMatches<'a>) -> Config {
     let mut args = Config::default();
 
-    args.entrypoint_addr = solana_netutil::parse_host_port(matches.value_of("entrypoint").unwrap())
-        .unwrap_or_else(|e| {
-            eprintln!("failed to parse entrypoint address: {}", e);
-            exit(1)
-        });
+    args.entrypoint_addr = solana_net_utils::parse_host_port(
+        matches.value_of("entrypoint").unwrap(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("failed to parse entrypoint address: {}", e);
+        exit(1)
+    });
 
-    args.drone_addr = solana_netutil::parse_host_port(matches.value_of("drone").unwrap())
+    args.drone_addr = solana_net_utils::parse_host_port(matches.value_of("drone").unwrap())
         .unwrap_or_else(|e| {
             eprintln!("failed to parse drone address: {}", e);
             exit(1)

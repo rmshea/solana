@@ -8,7 +8,6 @@ use num_derive::{FromPrimitive, ToPrimitive};
 pub enum SystemError {
     AccountAlreadyInUse,
     ResultWithNegativeLamports,
-    SourceNotSystemAccount,
     InvalidProgramId,
     InvalidAccountId,
 }
@@ -57,7 +56,7 @@ pub fn create_account(
 ) -> Instruction {
     let account_metas = vec![
         AccountMeta::new(*from_pubkey, true),
-        AccountMeta::new(*to_pubkey, false),
+        AccountMeta::new(*to_pubkey, true),
     ];
     Instruction::new(
         system_program::id(),
@@ -68,12 +67,6 @@ pub fn create_account(
         },
         account_metas,
     )
-}
-
-/// Create and sign a transaction to create a system account
-pub fn create_user_account(from_pubkey: &Pubkey, to_pubkey: &Pubkey, lamports: u64) -> Instruction {
-    let program_id = system_program::id();
-    create_account(from_pubkey, to_pubkey, lamports, 0, &program_id)
 }
 
 pub fn assign(from_pubkey: &Pubkey, program_id: &Pubkey) -> Instruction {
@@ -90,7 +83,7 @@ pub fn assign(from_pubkey: &Pubkey, program_id: &Pubkey) -> Instruction {
 pub fn transfer(from_pubkey: &Pubkey, to_pubkey: &Pubkey, lamports: u64) -> Instruction {
     let account_metas = vec![
         AccountMeta::new(*from_pubkey, true),
-        AccountMeta::new_credit_only(*to_pubkey, false),
+        AccountMeta::new(*to_pubkey, false),
     ];
     Instruction::new(
         system_program::id(),

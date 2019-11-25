@@ -1,17 +1,18 @@
 use serde_derive::{Deserialize, Serialize};
-use solana_config_api::ConfigState;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Signable, Signature};
-use std::borrow::Cow;
-use std::error;
-use std::io;
+use solana_config_program::ConfigState;
+use solana_sdk::{
+    hash::Hash,
+    pubkey::Pubkey,
+    signature::{Signable, Signature},
+};
+use std::{borrow::Cow, error, io};
 
 /// Information required to download and apply a given update
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq)]
 pub struct UpdateManifest {
     pub timestamp_secs: u64, // When the release was deployed in seconds since UNIX EPOCH
     pub download_url: String, // Download URL to the release tar.bz2
-    pub download_sha256: String, // SHA256 digest of the release tar.bz2 file
+    pub download_sha256: Hash, // SHA256 digest of the release tar.bz2 file
 }
 
 /// Userdata of an Update Manifest program Account.
@@ -56,8 +57,6 @@ impl SignedUpdateManifest {
 
 impl ConfigState for SignedUpdateManifest {
     fn max_space() -> u64 {
-        // TODO: Use a fully populated manifest to compute a better value
-        //      bincode::serialized_size(&Self::default()).unwrap()
-        256
+        256 // Enough space for a fully populated SignedUpdateManifest
     }
 }

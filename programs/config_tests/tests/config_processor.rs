@@ -2,14 +2,14 @@
 
 use bincode::{deserialize, serialized_size};
 use serde_derive::{Deserialize, Serialize};
-use solana_config_api::{
+use solana_config_program::{
     config_instruction, config_processor::process_instruction, get_config_data, id, ConfigKeys,
     ConfigState,
 };
 use solana_runtime::{bank::Bank, bank_client::BankClient};
 use solana_sdk::{
     client::SyncClient,
-    genesis_block::create_genesis_block,
+    genesis_config::create_genesis_config,
     instruction::InstructionError,
     message::Message,
     pubkey::Pubkey,
@@ -43,8 +43,8 @@ impl ConfigState for MyConfig {
 }
 
 fn create_bank(lamports: u64) -> (Bank, Keypair) {
-    let (genesis_block, mint_keypair) = create_genesis_block(lamports);
-    let mut bank = Bank::new(&genesis_block);
+    let (genesis_config, mint_keypair) = create_genesis_config(lamports);
+    let mut bank = Bank::new(&genesis_config);
     bank.add_instruction_processor(id(), process_instruction);
     (bank, mint_keypair)
 }
@@ -371,10 +371,11 @@ fn test_config_updates_requiring_config() {
 fn test_config_initialize_no_panic() {
     let (bank, alice_keypair) = create_bank(3);
     let bank_client = BankClient::new(bank);
+    let config_account = Keypair::new();
 
     let mut instructions = config_instruction::create_account::<MyConfig>(
         &alice_keypair.pubkey(),
-        &Pubkey::new_rand(),
+        &config_account.pubkey(),
         1,
         vec![],
     );
@@ -383,7 +384,7 @@ fn test_config_initialize_no_panic() {
     let message = Message::new(instructions);
     assert_eq!(
         bank_client
-            .send_message(&[&alice_keypair], message)
+            .send_message(&[&alice_keypair, &config_account], message)
             .unwrap_err()
             .unwrap(),
         TransactionError::InstructionError(1, InstructionError::NotEnoughAccountKeys)

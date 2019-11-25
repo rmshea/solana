@@ -1,8 +1,7 @@
 use crate::cluster_info::{ClusterInfo, GOSSIP_SLEEP_MILLIS};
+use crate::packet::Packets;
 use crate::poh_recorder::PohRecorder;
 use crate::result::Result;
-use crate::service::Service;
-use crate::sigverify_stage::VerifiedPackets;
 use crate::{packet, sigverify};
 use crossbeam_channel::Sender as CrossbeamSender;
 use solana_metrics::inc_new_counter_debug;
@@ -20,7 +19,7 @@ impl ClusterInfoVoteListener {
         exit: &Arc<AtomicBool>,
         cluster_info: Arc<RwLock<ClusterInfo>>,
         sigverify_disabled: bool,
-        sender: CrossbeamSender<VerifiedPackets>,
+        sender: CrossbeamSender<Vec<Packets>>,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
     ) -> Self {
         let exit = exit.clone();
@@ -45,37 +44,35 @@ impl ClusterInfoVoteListener {
         exit: Arc<AtomicBool>,
         cluster_info: &Arc<RwLock<ClusterInfo>>,
         sigverify_disabled: bool,
-        sender: &CrossbeamSender<VerifiedPackets>,
+        sender: &CrossbeamSender<Vec<Packets>>,
         poh_recorder: Arc<Mutex<PohRecorder>>,
     ) -> Result<()> {
-        let mut last_ts = 0;
         loop {
             if exit.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            let (votes, new_ts) = cluster_info.read().unwrap().get_votes(last_ts);
-            if poh_recorder.lock().unwrap().has_bank() {
-                last_ts = new_ts;
+            if let Some(bank) = poh_recorder.lock().unwrap().bank() {
+                let last_ts = bank.last_vote_sync.load(Ordering::Relaxed);
+                let (votes, new_ts) = cluster_info.read().unwrap().get_votes(last_ts);
+                bank.last_vote_sync
+                    .compare_and_swap(last_ts, new_ts, Ordering::Relaxed);
                 inc_new_counter_debug!("cluster_info_vote_listener-recv_count", votes.len());
-                let msgs = packet::to_packets(&votes);
+                let mut msgs = packet::to_packets(&votes);
                 if !msgs.is_empty() {
                     let r = if sigverify_disabled {
                         sigverify::ed25519_verify_disabled(&msgs)
                     } else {
                         sigverify::ed25519_verify_cpu(&msgs)
                     };
-                    sender.send(msgs.into_iter().zip(r).collect())?;
+                    sigverify::mark_disabled(&mut msgs, &r);
+                    sender.send(msgs)?;
                 }
             }
             sleep(Duration::from_millis(GOSSIP_SLEEP_MILLIS));
         }
     }
-}
 
-impl Service for ClusterInfoVoteListener {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         for thread_hdl in self.thread_hdls {
             thread_hdl.join()?;
         }
@@ -89,8 +86,8 @@ mod tests {
     use solana_sdk::hash::Hash;
     use solana_sdk::signature::{Keypair, KeypairUtil};
     use solana_sdk::transaction::Transaction;
-    use solana_vote_api::vote_instruction;
-    use solana_vote_api::vote_state::Vote;
+    use solana_vote_program::vote_instruction;
+    use solana_vote_program::vote_state::Vote;
 
     #[test]
     fn test_max_vote_tx_fits() {

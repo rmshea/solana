@@ -7,9 +7,9 @@ use crossbeam_channel::unbounded;
 use log::*;
 use rand::{thread_rng, Rng};
 use solana_core::packet::to_packets_chunked;
-use solana_core::service::Service;
+use solana_core::sigverify::TransactionSigVerifier;
 use solana_core::sigverify_stage::SigVerifyStage;
-use solana_core::test_tx::test_tx;
+use solana_perf::test_tx::test_tx;
 use solana_sdk::hash::Hash;
 use solana_sdk::signature::{Keypair, KeypairUtil};
 use solana_sdk::system_transaction;
@@ -23,8 +23,8 @@ fn bench_sigverify_stage(bencher: &mut Bencher) {
     solana_logger::setup();
     let (packet_s, packet_r) = channel();
     let (verified_s, verified_r) = unbounded();
-    let sigverify_disabled = false;
-    let stage = SigVerifyStage::new(packet_r, sigverify_disabled, verified_s);
+    let verifier = TransactionSigVerifier::default();
+    let stage = SigVerifyStage::new(packet_r, verified_s, verifier);
 
     let now = Instant::now();
     let len = 4096;
@@ -70,8 +70,8 @@ fn bench_sigverify_stage(bencher: &mut Bencher) {
         loop {
             if let Ok(mut verifieds) = verified_r.recv_timeout(Duration::from_millis(10)) {
                 while let Some(v) = verifieds.pop() {
-                    received += v.0.packets.len();
-                    batches.push(v.0);
+                    received += v.packets.len();
+                    batches.push(v);
                 }
                 if received >= sent_len {
                     break;

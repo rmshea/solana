@@ -25,10 +25,9 @@ pub struct FeeCalculator {
     pub burn_percent: u8,
 }
 
-/// TODO: determine good values for these
-pub const DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE: u64 = 42;
+pub const DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE: u64 = 100_000;
 pub const DEFAULT_TARGET_SIGNATURES_PER_SLOT: usize =
-    710_000 * DEFAULT_TICKS_PER_SLOT as usize / DEFAULT_TICKS_PER_SECOND as usize;
+    50_000 * DEFAULT_TICKS_PER_SLOT as usize / DEFAULT_TICKS_PER_SECOND as usize;
 pub const DEFAULT_BURN_PERCENT: u8 = ((50usize * std::u8::MAX as usize) / 100usize) as u8;
 
 impl Default for FeeCalculator {
@@ -65,9 +64,6 @@ impl FeeCalculator {
         if me.target_signatures_per_slot > 0 {
             // lamports_per_signature can range from 50% to 1000% of
             // target_lamports_per_signature
-            //
-            // TODO: Are these decent limits?
-            //
             me.min_lamports_per_signature = std::cmp::max(1, me.target_lamports_per_signature / 2);
             me.max_lamports_per_signature = me.target_lamports_per_signature * 10;
 
@@ -92,10 +88,8 @@ impl FeeCalculator {
             if gap == 0 {
                 me.lamports_per_signature = desired_lamports_per_signature;
             } else {
-                // Adjust fee by 5% of target_lamports_per_signature to produce a smooth increase/decrease in fees over time.
-                //
-                // TODO: Is this fee curve smooth enough or too smooth?
-                //
+                // Adjust fee by 5% of target_lamports_per_signature to produce a smooth
+                // increase/decrease in fees over time.
                 let gap_adjust =
                     std::cmp::max(1, me.target_lamports_per_signature / 20) as i64 * gap.signum();
 
@@ -196,8 +190,14 @@ mod tests {
             f1.target_signatures_per_slot,
             DEFAULT_TARGET_SIGNATURES_PER_SLOT
         );
-        assert_eq!(f1.target_lamports_per_signature, 42);
-        assert_eq!(f1.lamports_per_signature, 21); // min
+        assert_eq!(
+            f1.target_lamports_per_signature,
+            DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE
+        );
+        assert_eq!(
+            f1.lamports_per_signature,
+            DEFAULT_TARGET_LAMPORTS_PER_SIGNATURE / 2
+        ); // min
     }
 
     #[test]

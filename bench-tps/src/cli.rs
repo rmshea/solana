@@ -1,10 +1,10 @@
-use clap::{crate_description, crate_name, crate_version, App, Arg, ArgMatches};
+use clap::{crate_description, crate_name, App, Arg, ArgMatches};
 use solana_drone::drone::DRONE_PORT;
 use solana_sdk::fee_calculator::FeeCalculator;
 use solana_sdk::signature::{read_keypair_file, Keypair, KeypairUtil};
 use std::{net::SocketAddr, process::exit, time::Duration};
 
-const NUM_LAMPORTS_PER_ACCOUNT_DEFAULT: u64 = 64 * 1024;
+const NUM_LAMPORTS_PER_ACCOUNT_DEFAULT: u64 = solana_sdk::native_token::SOL_LAMPORTS;
 
 /// Holds the configuration for a single run of the benchmark
 pub struct Config {
@@ -21,6 +21,7 @@ pub struct Config {
     pub write_to_client_file: bool,
     pub read_from_client_file: bool,
     pub target_lamports_per_signature: u64,
+    pub multi_client: bool,
     pub use_move: bool,
     pub num_lamports_per_account: u64,
 }
@@ -41,6 +42,7 @@ impl Default for Config {
             write_to_client_file: false,
             read_from_client_file: false,
             target_lamports_per_signature: FeeCalculator::default().target_lamports_per_signature,
+            multi_client: true,
             use_move: false,
             num_lamports_per_account: NUM_LAMPORTS_PER_ACCOUNT_DEFAULT,
         }
@@ -48,9 +50,9 @@ impl Default for Config {
 }
 
 /// Defines and builds the CLI args for a run of the benchmark
-pub fn build_args<'a, 'b>() -> App<'a, 'b> {
+pub fn build_args<'a, 'b>(version: &'b str) -> App<'a, 'b> {
     App::new(crate_name!()).about(crate_description!())
-        .version(crate_version!())
+        .version(version)
         .arg(
             Arg::with_name("entrypoint")
                 .short("n")
@@ -107,6 +109,11 @@ pub fn build_args<'a, 'b>() -> App<'a, 'b> {
             Arg::with_name("use-move")
                 .long("use-move")
                 .help("Use Move language transactions to perform transfers."),
+        )
+        .arg(
+            Arg::with_name("no-multi-client")
+                .long("no-multi-client")
+                .help("Disable multi-client support, only transact with the entrypoint."),
         )
         .arg(
             Arg::with_name("tx_count")
@@ -167,14 +174,14 @@ pub fn extract_args<'a>(matches: &ArgMatches<'a>) -> Config {
     let mut args = Config::default();
 
     if let Some(addr) = matches.value_of("entrypoint") {
-        args.entrypoint_addr = solana_netutil::parse_host_port(addr).unwrap_or_else(|e| {
+        args.entrypoint_addr = solana_net_utils::parse_host_port(addr).unwrap_or_else(|e| {
             eprintln!("failed to parse entrypoint address: {}", e);
             exit(1)
         });
     }
 
     if let Some(addr) = matches.value_of("drone") {
-        args.drone_addr = solana_netutil::parse_host_port(addr).unwrap_or_else(|e| {
+        args.drone_addr = solana_net_utils::parse_host_port(addr).unwrap_or_else(|e| {
             eprintln!("failed to parse drone address: {}", e);
             exit(1)
         });
@@ -229,6 +236,7 @@ pub fn extract_args<'a>(matches: &ArgMatches<'a>) -> Config {
     }
 
     args.use_move = matches.is_present("use-move");
+    args.multi_client = !matches.is_present("no-multi-client");
 
     if let Some(v) = matches.value_of("num_lamports_per_account") {
         args.num_lamports_per_account = v.to_string().parse().expect("can't parse lamports");

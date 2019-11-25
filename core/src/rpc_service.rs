@@ -1,20 +1,20 @@
 //! The `rpc_service` module implements the Solana JSON RPC service.
 
 use crate::{
-    bank_forks::BankForks, cluster_info::ClusterInfo, confidence::ForkConfidenceCache, rpc::*,
-    service::Service, storage_stage::StorageState, validator::ValidatorExit,
+    cluster_info::ClusterInfo, commitment::BlockCommitmentCache, rpc::*,
+    storage_stage::StorageState, validator::ValidatorExit,
 };
 use jsonrpc_core::MetaIoHandler;
 use jsonrpc_http_server::{
     hyper, AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
     RequestMiddlewareAction, ServerBuilder,
 };
+use solana_ledger::{bank_forks::BankForks, blocktree::Blocktree};
 use solana_sdk::hash::Hash;
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::mpsc::channel,
-    sync::{Arc, RwLock},
+    sync::{mpsc::channel, Arc, RwLock},
     thread::{self, Builder, JoinHandle},
 };
 use tokio::prelude::Future;
@@ -52,6 +52,7 @@ impl RpcRequestMiddleware {
     }
 
     fn get(&self, filename: &str) -> RequestMiddlewareAction {
+        info!("get {}", filename);
         let filename = self.ledger_path.join(filename);
         RequestMiddlewareAction::Respond {
             should_validate_hosts: true,
@@ -84,24 +85,27 @@ impl RequestMiddleware for RpcRequestMiddleware {
 }
 
 impl JsonRpcService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cluster_info: &Arc<RwLock<ClusterInfo>>,
         rpc_addr: SocketAddr,
-        storage_state: StorageState,
         config: JsonRpcConfig,
         bank_forks: Arc<RwLock<BankForks>>,
-        fork_confidence_cache: Arc<RwLock<ForkConfidenceCache>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        blocktree: Arc<Blocktree>,
+        cluster_info: &Arc<RwLock<ClusterInfo>>,
+        genesis_hash: Hash,
         ledger_path: &Path,
-        genesis_blockhash: Hash,
+        storage_state: StorageState,
         validator_exit: &Arc<RwLock<Option<ValidatorExit>>>,
     ) -> Self {
         info!("rpc bound to {:?}", rpc_addr);
         info!("rpc configuration: {:?}", config);
         let request_processor = Arc::new(RwLock::new(JsonRpcRequestProcessor::new(
-            storage_state,
             config,
             bank_forks,
-            fork_confidence_cache,
+            block_commitment_cache,
+            blocktree,
+            storage_state,
             validator_exit,
         )));
         let request_processor_ = request_processor.clone();
@@ -121,7 +125,7 @@ impl JsonRpcService {
                     ServerBuilder::with_meta_extractor(io, move |_req: &hyper::Request<hyper::Body>| Meta {
                         request_processor: request_processor_.clone(),
                         cluster_info: cluster_info.clone(),
-                        genesis_blockhash
+                        genesis_hash
                     }).threads(4)
                         .cors(DomainsValidation::AllowOnly(vec![
                             AccessControlAllowOrigin::Any,
@@ -159,12 +163,8 @@ impl JsonRpcService {
             c.close()
         }
     }
-}
 
-impl Service for JsonRpcService {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         self.thread_hdl.join()
     }
 }
@@ -172,9 +172,12 @@ impl Service for JsonRpcService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contact_info::ContactInfo;
-    use crate::genesis_utils::{create_genesis_block, GenesisBlockInfo};
-    use crate::rpc::tests::create_validator_exit;
+    use crate::{
+        contact_info::ContactInfo,
+        genesis_utils::{create_genesis_config, GenesisConfigInfo},
+        rpc::tests::create_validator_exit,
+    };
+    use solana_ledger::get_tmp_ledger_path;
     use solana_runtime::bank::Bank;
     use solana_sdk::signature::KeypairUtil;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -182,32 +185,35 @@ mod tests {
 
     #[test]
     fn test_rpc_new() {
-        let GenesisBlockInfo {
-            genesis_block,
+        let GenesisConfigInfo {
+            genesis_config,
             mint_keypair,
             ..
-        } = create_genesis_block(10_000);
+        } = create_genesis_config(10_000);
         let exit = Arc::new(AtomicBool::new(false));
         let validator_exit = create_validator_exit(&exit);
-        let bank = Bank::new(&genesis_block);
+        let bank = Bank::new(&genesis_config);
         let cluster_info = Arc::new(RwLock::new(ClusterInfo::new_with_invalid_keypair(
             ContactInfo::default(),
         )));
         let rpc_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            solana_netutil::find_available_port_in_range((10000, 65535)).unwrap(),
+            solana_net_utils::find_available_port_in_range((10000, 65535)).unwrap(),
         );
         let bank_forks = Arc::new(RwLock::new(BankForks::new(bank.slot(), bank)));
-        let fork_confidence_cache = Arc::new(RwLock::new(ForkConfidenceCache::default()));
+        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
+        let ledger_path = get_tmp_ledger_path!();
+        let blocktree = Blocktree::open(&ledger_path).unwrap();
         let mut rpc_service = JsonRpcService::new(
-            &cluster_info,
             rpc_addr,
-            StorageState::default(),
             JsonRpcConfig::default(),
             bank_forks,
-            fork_confidence_cache,
-            &PathBuf::from("farf"),
+            block_commitment_cache,
+            Arc::new(blocktree),
+            &cluster_info,
             Hash::default(),
+            &PathBuf::from("farf"),
+            StorageState::default(),
             &validator_exit,
         );
         let thread = rpc_service.thread_hdl.thread();
@@ -219,7 +225,9 @@ mod tests {
                 .request_processor
                 .read()
                 .unwrap()
-                .get_balance(&mint_keypair.pubkey())
+                .get_balance(Ok(mint_keypair.pubkey()), None)
+                .unwrap()
+                .value
         );
         rpc_service.exit();
         rpc_service.join().unwrap();

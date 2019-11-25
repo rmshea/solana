@@ -60,6 +60,7 @@ pub type Result<T> = result::Result<T, TransactionError>;
 pub struct Transaction {
     /// A set of digital signatures of `account_keys`, `program_ids`, `recent_blockhash`, and `instructions`, signed by the first
     /// signatures.len() keys of account_keys
+    /// NOTE: Serialization-related changes must be paired with the direct read at sigverify.
     #[serde(with = "short_vec")]
     pub signatures: Vec<Signature>,
 
@@ -417,12 +418,12 @@ mod tests {
 
         let len_size = 1;
         let num_required_sigs_size = 1;
-        let num_credit_only_accounts_size = 2;
+        let num_readonly_accounts_size = 2;
         let blockhash_size = size_of::<Hash>();
         let expected_transaction_size = len_size
             + (tx.signatures.len() * size_of::<Signature>())
             + num_required_sigs_size
-            + num_credit_only_accounts_size
+            + num_readonly_accounts_size
             + len_size
             + (tx.message.account_keys.len() * size_of::<Pubkey>())
             + blockhash_size

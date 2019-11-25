@@ -75,6 +75,7 @@ source multinode-demo/common.sh
 nodes=(
   "multinode-demo/drone.sh"
   "multinode-demo/bootstrap-leader.sh \
+    --no-restart \
     --init-complete-file init-complete-node1.log \
     --dynamic-port-range 8000-8050"
   "multinode-demo/validator.sh \
@@ -153,7 +154,7 @@ startNodes() {
     addLogs=true
   fi
   initCompleteFiles=()
-  maybeExpectedGenesisBlockhash=
+  maybeExpectedGenesisHash=
   for i in $(seq 0 $((${#nodes[@]} - 1))); do
     declare cmd=${nodes[$i]}
 
@@ -162,7 +163,7 @@ startNodes() {
       rm -f "$initCompleteFile"
       initCompleteFiles+=("$initCompleteFile")
     fi
-    startNode "$i" "$cmd $maybeExpectedGenesisBlockhash"
+    startNode "$i" "$cmd $maybeExpectedGenesisHash"
     if $addLogs; then
       logs+=("$(getNodeLogFile "$i" "$cmd")")
     fi
@@ -176,9 +177,9 @@ startNodes() {
       (
         set -x
         $solana_cli --keypair config/bootstrap-leader/identity-keypair.json \
-          --url http://127.0.0.1:8899 get-genesis-blockhash
-      ) | tee genesis-blockhash.log
-      maybeExpectedGenesisBlockhash="--expected-genesis-blockhash $(tail -n1 genesis-blockhash.log)"
+          --url http://127.0.0.1:8899 get-genesis-hash
+      ) | tee genesis-hash.log
+      maybeExpectedGenesisHash="--expected-genesis-hash $(tail -n1 genesis-hash.log)"
     fi
   done
 
@@ -324,7 +325,7 @@ while [[ $iteration -le $iterations ]]; do
     set -x
     client_keypair=/tmp/client-id.json-$$
     $solana_keygen new -f -o $client_keypair || exit $?
-    $solana_gossip spy --num-nodes-exactly $numNodes || exit $?
+    $solana_gossip spy -n 127.0.0.1:8001 --num-nodes-exactly $numNodes || exit $?
     rm -rf $client_keypair
   ) || flag_error
 
@@ -364,7 +365,7 @@ while [[ $iteration -le $iterations ]]; do
   echo "--- Wallet sanity ($iteration)"
   (
     set -x
-    timeout 60s scripts/wallet-sanity.sh --url http://127.0.0.1"$walletRpcPort"
+    timeout 90s scripts/wallet-sanity.sh --url http://127.0.0.1"$walletRpcPort"
   ) || flag_error
 
   iteration=$((iteration + 1))

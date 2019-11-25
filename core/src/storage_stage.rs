@@ -1,52 +1,59 @@
 // A stage that handles generating the keys used to encrypt the ledger and sample it
-// for storage mining. Replicators submit storage proofs, validator then bundles them
+// for storage mining. Archivers submit storage proofs, validator then bundles them
 // to submit its proof for mining to be rewarded.
 
-use crate::bank_forks::BankForks;
-use crate::blocktree::Blocktree;
-use crate::chacha_cuda::chacha_cbc_encrypt_file_many_keys;
-use crate::cluster_info::ClusterInfo;
-use crate::result::{Error, Result};
-use crate::service::Service;
+use crate::{
+    chacha_cuda::chacha_cbc_encrypt_file_many_keys,
+    cluster_info::ClusterInfo,
+    contact_info::ContactInfo,
+    result::{Error, Result},
+};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaChaRng;
-use solana_runtime::bank::Bank;
-use solana_runtime::storage_utils::replicator_accounts;
-use solana_sdk::account::Account;
-use solana_sdk::account_utils::State;
-use solana_sdk::clock::get_segment_from_slot;
-use solana_sdk::hash::Hash;
-use solana_sdk::instruction::Instruction;
-use solana_sdk::message::Message;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, KeypairUtil, Signature};
-use solana_sdk::transaction::Transaction;
-use solana_storage_api::storage_contract::{Proof, ProofStatus, StorageContract};
-use solana_storage_api::storage_instruction;
-use solana_storage_api::storage_instruction::proof_validation;
-use std::collections::HashMap;
-use std::mem::size_of;
-use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, RwLock};
-use std::thread::{self, sleep, Builder, JoinHandle};
-use std::time::{Duration, Instant};
-use std::{cmp, io};
+use solana_ledger::{bank_forks::BankForks, blocktree::Blocktree};
+use solana_runtime::{bank::Bank, storage_utils::archiver_accounts};
+use solana_sdk::{
+    account::Account,
+    account_utils::State,
+    clock::{get_segment_from_slot, Slot},
+    hash::Hash,
+    instruction::Instruction,
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, KeypairUtil, Signature},
+    transaction::Transaction,
+};
+use solana_storage_program::{
+    storage_contract::{Proof, ProofStatus, StorageContract},
+    storage_instruction,
+    storage_instruction::proof_validation,
+};
+use std::{
+    cmp,
+    collections::HashMap,
+    io,
+    mem::size_of,
+    net::UdpSocket,
+    sync::atomic::{AtomicBool, Ordering},
+    sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender},
+    sync::{Arc, RwLock},
+    thread::{self, sleep, Builder, JoinHandle},
+    time::{Duration, Instant},
+};
 
 // Block of hash answers to validate against
 // Vec of [ledger blocks] x [keys]
 type StorageResults = Vec<Hash>;
 type StorageKeys = Vec<u8>;
-type ReplicatorMap = Vec<HashMap<Pubkey, Vec<Proof>>>;
+type ArchiverMap = Vec<HashMap<Pubkey, Vec<Proof>>>;
 
 #[derive(Default)]
 pub struct StorageStateInner {
     storage_results: StorageResults,
-    storage_keys: StorageKeys,
-    replicator_map: ReplicatorMap,
+    pub storage_keys: StorageKeys,
+    archiver_map: ArchiverMap,
     storage_blockhash: Hash,
-    slot: u64,
+    slot: Slot,
     slots_per_segment: u64,
     slots_per_turn: u64,
 }
@@ -61,7 +68,7 @@ struct StorageSlots {
 
 #[derive(Clone, Default)]
 pub struct StorageState {
-    state: Arc<RwLock<StorageStateInner>>,
+    pub state: Arc<RwLock<StorageStateInner>>,
 }
 
 pub struct StorageStage {
@@ -91,12 +98,12 @@ impl StorageState {
     pub fn new(hash: &Hash, slots_per_turn: u64, slots_per_segment: u64) -> Self {
         let storage_keys = vec![0u8; KEY_SIZE * NUM_IDENTITIES];
         let storage_results = vec![Hash::default(); NUM_IDENTITIES];
-        let replicator_map = vec![];
+        let archiver_map = vec![];
 
         let state = StorageStateInner {
             storage_keys,
             storage_results,
-            replicator_map,
+            archiver_map,
             slots_per_turn,
             slot: 0,
             slots_per_segment,
@@ -132,24 +139,23 @@ impl StorageState {
 
     pub fn get_pubkeys_for_slot(
         &self,
-        slot: u64,
+        slot: Slot,
         bank_forks: &Arc<RwLock<BankForks>>,
     ) -> Vec<Pubkey> {
         // TODO: keep track of age?
         const MAX_PUBKEYS_TO_RETURN: usize = 5;
         let index =
             get_segment_from_slot(slot, self.state.read().unwrap().slots_per_segment) as usize;
-        let replicator_map = &self.state.read().unwrap().replicator_map;
+        let archiver_map = &self.state.read().unwrap().archiver_map;
         let working_bank = bank_forks.read().unwrap().working_bank();
-        let accounts = replicator_accounts(&working_bank);
-        if index < replicator_map.len() {
+        let accounts = archiver_accounts(&working_bank);
+        if index < archiver_map.len() {
             //perform an account owner lookup
-            let mut slot_replicators = replicator_map[index]
+            let mut slot_archivers = archiver_map[index]
                 .keys()
                 .filter_map(|account_id| {
                     accounts.get(account_id).and_then(|account| {
-                        if let Ok(StorageContract::ReplicatorStorage { owner, .. }) =
-                            account.state()
+                        if let Ok(StorageContract::ArchiverStorage { owner, .. }) = account.state()
                         {
                             Some(owner)
                         } else {
@@ -158,8 +164,8 @@ impl StorageState {
                     })
                 })
                 .collect::<Vec<_>>();
-            slot_replicators.truncate(MAX_PUBKEYS_TO_RETURN);
-            slot_replicators
+            slot_archivers.truncate(MAX_PUBKEYS_TO_RETURN);
+            slot_archivers
         } else {
             vec![]
         }
@@ -362,11 +368,12 @@ impl StorageStage {
     fn process_turn(
         storage_keypair: &Arc<Keypair>,
         state: &Arc<RwLock<StorageStateInner>>,
-        _blocktree: &Arc<Blocktree>,
+        blocktree: &Arc<Blocktree>,
         blockhash: Hash,
-        slot: u64,
+        slot: Slot,
         slots_per_segment: u64,
         instruction_sender: &InstructionSender,
+        total_proofs: usize,
     ) -> Result<()> {
         let mut seed = [0u8; 32];
         let signature = storage_keypair.sign(&blockhash.as_ref());
@@ -386,6 +393,10 @@ impl StorageStage {
             let mut w_state = state.write().unwrap();
             w_state.slot = slot;
             w_state.storage_blockhash = blockhash;
+        }
+
+        if total_proofs == 0 {
+            return Ok(());
         }
 
         // Regenerate the answers
@@ -411,7 +422,7 @@ impl StorageStage {
         // TODO: cuda required to generate the reference values
         // but if it is missing, then we need to take care not to
         // process storage mining results.
-        if crate::perf_libs::api().is_some() {
+        if solana_perf::perf_libs::api().is_some() {
             // Lock the keys, since this is the IV memory,
             // it will be updated in-place by the encryption.
             // Should be overwritten by the proof signatures which replace the
@@ -420,7 +431,7 @@ impl StorageStage {
             let mut statew = state.write().unwrap();
 
             match chacha_cbc_encrypt_file_many_keys(
-                _blocktree,
+                blocktree,
                 segment as u64,
                 statew.slots_per_segment,
                 &mut statew.storage_keys,
@@ -440,14 +451,15 @@ impl StorageStage {
     }
 
     fn collect_proofs(
-        slot: u64,
+        slot: Slot,
         slots_per_segment: u64,
         account_id: Pubkey,
         account: Account,
         storage_state: &Arc<RwLock<StorageStateInner>>,
         current_key_idx: &mut usize,
-    ) {
-        if let Ok(StorageContract::ReplicatorStorage { proofs, .. }) = account.state() {
+    ) -> usize {
+        let mut proofs_collected = 0;
+        if let Ok(StorageContract::ArchiverStorage { proofs, .. }) = account.state() {
             //convert slot to segment
             let segment = get_segment_from_slot(slot, slots_per_segment);
             if let Some(proofs) = proofs.get(&segment) {
@@ -466,24 +478,24 @@ impl StorageStage {
                     }
 
                     let mut statew = storage_state.write().unwrap();
-                    if statew.replicator_map.len() < segment as usize {
-                        statew
-                            .replicator_map
-                            .resize(segment as usize, HashMap::new());
+                    if statew.archiver_map.len() < segment as usize {
+                        statew.archiver_map.resize(segment as usize, HashMap::new());
                     }
                     let proof_segment_index = proof.segment_index as usize;
-                    if proof_segment_index < statew.replicator_map.len() {
+                    if proof_segment_index < statew.archiver_map.len() {
                         // TODO randomly select and verify the proof first
                         // Copy the submitted proof
-                        statew.replicator_map[proof_segment_index]
+                        statew.archiver_map[proof_segment_index]
                             .entry(account_id)
                             .or_default()
                             .push(proof.clone());
+                        proofs_collected += 1;
                     }
                 }
                 debug!("storage proof: slot: {}", slot);
             }
         }
+        proofs_collected
     }
 
     fn process_entries(
@@ -509,12 +521,13 @@ impl StorageStage {
                 storage_slots.slot_count += 1;
                 storage_slots.last_root = bank.slot();
                 if storage_slots.slot_count % slots_per_turn == 0 {
-                    // load all the replicator accounts in the bank. collect all their proofs at the current slot
-                    let replicator_accounts = replicator_accounts(bank.as_ref());
+                    // load all the archiver accounts in the bank. collect all their proofs at the current slot
+                    let archiver_accounts = archiver_accounts(bank.as_ref());
                     // find proofs, and use them to update
                     // the storage_keys with their signatures
-                    for (account_id, account) in replicator_accounts.into_iter() {
-                        Self::collect_proofs(
+                    let mut total_proofs = 0;
+                    for (account_id, account) in archiver_accounts.into_iter() {
+                        total_proofs += Self::collect_proofs(
                             bank.slot(),
                             bank.slots_per_segment(),
                             account_id,
@@ -533,6 +546,7 @@ impl StorageStage {
                         bank.slot(),
                         bank.slots_per_segment(),
                         instruction_sender,
+                        total_proofs,
                     );
                     Self::submit_verifications(
                         get_segment_from_slot(bank.slot(), bank.slots_per_segment()),
@@ -552,13 +566,13 @@ impl StorageStage {
         storage_keypair: &Arc<Keypair>,
         ix_sender: &Sender<Instruction>,
     ) -> Result<()> {
-        // bundle up mining submissions from replicators
+        // bundle up mining submissions from archivers
         // and submit them in a tx to the leader to get rewarded.
         let mut w_state = storage_state.write().unwrap();
         let mut max_proof_mask = 0;
         let proof_mask_limit = storage_instruction::proof_mask_limit();
         let instructions: Vec<_> = w_state
-            .replicator_map
+            .archiver_map
             .iter_mut()
             .enumerate()
             .flat_map(|(_, proof_map)| {
@@ -615,40 +629,31 @@ impl StorageStage {
         res?;
         Ok(())
     }
-}
 
-impl Service for StorageStage {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         self.t_storage_create_accounts.join().unwrap();
         self.t_storage_mining_verifier.join()
     }
 }
 
+pub fn test_cluster_info(id: &Pubkey) -> Arc<RwLock<ClusterInfo>> {
+    let contact_info = ContactInfo::new_localhost(id, 0);
+    let cluster_info = ClusterInfo::new_with_invalid_keypair(contact_info);
+    Arc::new(RwLock::new(cluster_info))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocktree::{create_new_tmp_ledger, Blocktree};
-    use crate::cluster_info::ClusterInfo;
-    use crate::contact_info::ContactInfo;
-    use crate::genesis_utils::{create_genesis_block, GenesisBlockInfo};
-    use crate::service::Service;
-    use crate::{blocktree_processor, entry};
+    use crate::genesis_utils::{create_genesis_config, GenesisConfigInfo};
     use rayon::prelude::*;
     use solana_runtime::bank::Bank;
-    use solana_sdk::clock::DEFAULT_TICKS_PER_SLOT;
-    use solana_sdk::hash::{Hash, Hasher};
-    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::hash::Hasher;
     use solana_sdk::signature::{Keypair, KeypairUtil};
-    use solana_storage_api::storage_instruction::StorageAccountType;
     use std::cmp::{max, min};
-    use std::fs::remove_dir_all;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::channel;
     use std::sync::{Arc, RwLock};
-    use std::thread::sleep;
-    use std::time::Duration;
 
     #[test]
     fn test_storage_stage_none_ledger() {
@@ -657,8 +662,8 @@ mod tests {
         let exit = Arc::new(AtomicBool::new(false));
 
         let cluster_info = test_cluster_info(&keypair.pubkey());
-        let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(1000);
-        let bank = Arc::new(Bank::new(&genesis_block));
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(1000);
+        let bank = Arc::new(Bank::new(&genesis_config));
         let bank_forks = Arc::new(RwLock::new(BankForks::new_from_banks(
             &[bank.clone()],
             vec![0],
@@ -681,224 +686,6 @@ mod tests {
         );
         exit.store(true, Ordering::Relaxed);
         storage_stage.join().unwrap();
-    }
-
-    fn test_cluster_info(id: &Pubkey) -> Arc<RwLock<ClusterInfo>> {
-        let contact_info = ContactInfo::new_localhost(id, 0);
-        let cluster_info = ClusterInfo::new_with_invalid_keypair(contact_info);
-        Arc::new(RwLock::new(cluster_info))
-    }
-
-    #[test]
-    fn test_storage_stage_process_banks() {
-        solana_logger::setup();
-        let keypair = Arc::new(Keypair::new());
-        let storage_keypair = Arc::new(Keypair::new());
-        let exit = Arc::new(AtomicBool::new(false));
-
-        let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(1000);
-        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
-
-        let blocktree = Arc::new(Blocktree::open(&ledger_path).unwrap());
-        let slot = 1;
-        let bank = Arc::new(Bank::new(&genesis_block));
-        let bank_forks = Arc::new(RwLock::new(BankForks::new_from_banks(
-            &[bank.clone()],
-            vec![0],
-        )));
-
-        let cluster_info = test_cluster_info(&keypair.pubkey());
-        let (bank_sender, bank_receiver) = channel();
-        let storage_state = StorageState::new(
-            &bank.last_blockhash(),
-            SLOTS_PER_TURN_TEST,
-            bank.slots_per_segment(),
-        );
-        let storage_stage = StorageStage::new(
-            &storage_state,
-            bank_receiver,
-            Some(blocktree.clone()),
-            &keypair,
-            &storage_keypair,
-            &exit.clone(),
-            &bank_forks,
-            &cluster_info,
-        );
-        bank_sender.send(vec![bank.clone()]).unwrap();
-
-        let keypair = Keypair::new();
-        let hash = Hash::default();
-        let signature = keypair.sign_message(&hash.as_ref());
-
-        let mut result = storage_state.get_mining_result(&signature);
-
-        assert_eq!(result, Hash::default());
-
-        let mut last_bank = bank;
-        let rooted_banks = (slot..slot + last_bank.slots_per_segment() + 1)
-            .map(|i| {
-                let bank = Arc::new(Bank::new_from_parent(&last_bank, &keypair.pubkey(), i));
-                blocktree_processor::process_entries(
-                    &bank,
-                    &entry::create_ticks(64, bank.last_blockhash()),
-                    true,
-                )
-                .expect("failed process entries");
-                last_bank = bank;
-                last_bank.clone()
-            })
-            .collect::<Vec<_>>();
-        bank_sender.send(rooted_banks).unwrap();
-
-        if crate::perf_libs::api().is_some() {
-            for _ in 0..5 {
-                result = storage_state.get_mining_result(&signature);
-                if result != Hash::default() {
-                    info!("found result = {:?} sleeping..", result);
-                    break;
-                }
-                info!("result = {:?} sleeping..", result);
-                sleep(Duration::new(1, 0));
-            }
-        }
-
-        info!("joining..?");
-        exit.store(true, Ordering::Relaxed);
-        storage_stage.join().unwrap();
-
-        if crate::perf_libs::api().is_some() {
-            assert_ne!(result, Hash::default());
-        } else {
-            assert_eq!(result, Hash::default());
-        }
-
-        remove_dir_all(ledger_path).unwrap();
-    }
-
-    #[test]
-    fn test_storage_stage_process_account_proofs() {
-        solana_logger::setup();
-        let keypair = Arc::new(Keypair::new());
-        let storage_keypair = Arc::new(Keypair::new());
-        let replicator_keypair = Arc::new(Keypair::new());
-        let exit = Arc::new(AtomicBool::new(false));
-
-        let GenesisBlockInfo {
-            mut genesis_block,
-            mint_keypair,
-            ..
-        } = create_genesis_block(1000);
-        genesis_block
-            .native_instruction_processors
-            .push(solana_storage_program::solana_storage_program!());
-        let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
-
-        let blocktree = Arc::new(Blocktree::open(&ledger_path).unwrap());
-
-        let bank = Bank::new(&genesis_block);
-        let bank = Arc::new(bank);
-        let bank_forks = Arc::new(RwLock::new(BankForks::new_from_banks(
-            &[bank.clone()],
-            vec![0],
-        )));
-        let cluster_info = test_cluster_info(&keypair.pubkey());
-
-        let (bank_sender, bank_receiver) = channel();
-        let storage_state = StorageState::new(
-            &bank.last_blockhash(),
-            SLOTS_PER_TURN_TEST,
-            bank.slots_per_segment(),
-        );
-        let storage_stage = StorageStage::new(
-            &storage_state,
-            bank_receiver,
-            Some(blocktree.clone()),
-            &keypair,
-            &storage_keypair,
-            &exit.clone(),
-            &bank_forks,
-            &cluster_info,
-        );
-        bank_sender.send(vec![bank.clone()]).unwrap();
-
-        // create accounts
-        let bank = Arc::new(Bank::new_from_parent(&bank, &keypair.pubkey(), 1));
-        let account_ix = storage_instruction::create_storage_account(
-            &mint_keypair.pubkey(),
-            &Pubkey::new_rand(),
-            &replicator_keypair.pubkey(),
-            1,
-            StorageAccountType::Replicator,
-        );
-        let account_tx = Transaction::new_signed_instructions(
-            &[&mint_keypair],
-            account_ix,
-            bank.last_blockhash(),
-        );
-        bank.process_transaction(&account_tx).expect("create");
-
-        bank_sender.send(vec![bank.clone()]).unwrap();
-
-        let mut reference_keys;
-        {
-            let keys = &storage_state.state.read().unwrap().storage_keys;
-            reference_keys = vec![0; keys.len()];
-            reference_keys.copy_from_slice(keys);
-        }
-
-        let keypair = Keypair::new();
-
-        let mining_proof_ix = storage_instruction::mining_proof(
-            &replicator_keypair.pubkey(),
-            Hash::default(),
-            0,
-            keypair.sign_message(b"test"),
-            bank.last_blockhash(),
-        );
-
-        let next_bank = Arc::new(Bank::new_from_parent(&bank, &keypair.pubkey(), 2));
-        //register ticks so the program reports a different segment
-        blocktree_processor::process_entries(
-            &next_bank,
-            &entry::create_ticks(
-                DEFAULT_TICKS_PER_SLOT * next_bank.slots_per_segment() + 1,
-                bank.last_blockhash(),
-            ),
-            true,
-        )
-        .unwrap();
-        let message = Message::new_with_payer(vec![mining_proof_ix], Some(&mint_keypair.pubkey()));
-        let mining_proof_tx = Transaction::new(
-            &[&mint_keypair, replicator_keypair.as_ref()],
-            message,
-            next_bank.last_blockhash(),
-        );
-        next_bank
-            .process_transaction(&mining_proof_tx)
-            .expect("process txs");
-        bank_sender.send(vec![next_bank]).unwrap();
-
-        for _ in 0..5 {
-            {
-                let keys = &storage_state.state.read().unwrap().storage_keys;
-                if keys[..] != *reference_keys.as_slice() {
-                    break;
-                }
-            }
-
-            sleep(Duration::new(1, 0));
-        }
-
-        debug!("joining..?");
-        exit.store(true, Ordering::Relaxed);
-        storage_stage.join().unwrap();
-
-        {
-            let keys = &storage_state.state.read().unwrap().storage_keys;
-            assert_ne!(keys[..], *reference_keys);
-        }
-
-        remove_dir_all(ledger_path).unwrap();
     }
 
     #[test]

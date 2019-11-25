@@ -1,12 +1,13 @@
 //! The `fetch_stage` batches input from a UDP socket and sends it to a channel.
 
 use crate::banking_stage::FORWARD_TRANSACTIONS_TO_LEADER_AT_SLOT_OFFSET;
+use crate::packet::PacketsRecycler;
 use crate::poh_recorder::PohRecorder;
-use crate::recycler::Recycler;
 use crate::result::{Error, Result};
-use crate::service::Service;
 use crate::streamer::{self, PacketReceiver, PacketSender};
+use crate::thread_mem_usage;
 use solana_metrics::{inc_new_counter_debug, inc_new_counter_info};
+use solana_perf::recycler::Recycler;
 use solana_sdk::clock::DEFAULT_TICKS_PER_SLOT;
 use std::net::UdpSocket;
 use std::sync::atomic::AtomicBool;
@@ -92,7 +93,8 @@ impl FetchStage {
         sender: &PacketSender,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
     ) -> Self {
-        let recycler = Recycler::default();
+        let recycler: PacketsRecycler = Recycler::warmed(1000, 1024);
+
         let tpu_threads = sockets.into_iter().map(|socket| {
             streamer::receiver(
                 socket,
@@ -120,6 +122,7 @@ impl FetchStage {
         let fwd_thread_hdl = Builder::new()
             .name("solana-fetch-stage-fwd-rcvr".to_string())
             .spawn(move || loop {
+                thread_mem_usage::datapoint("solana-fetch-stage-fwd-rcvr");
                 if let Err(e) =
                     Self::handle_forwarded_packets(&forward_receiver, &sender, &poh_recorder)
                 {
@@ -138,12 +141,8 @@ impl FetchStage {
         thread_hdls.push(fwd_thread_hdl);
         Self { thread_hdls }
     }
-}
 
-impl Service for FetchStage {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         for thread_hdl in self.thread_hdls {
             thread_hdl.join()?;
         }

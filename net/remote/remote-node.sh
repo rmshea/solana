@@ -25,6 +25,7 @@ benchExchangeExtraArgs="${16}"
 genesisOptions="${17}"
 extraNodeArgs="${18}"
 gpuMode="${19:-auto}"
+GEOLOCATION_API_KEY="${20}"
 set +x
 
 # Use a very large stake (relative to the default multinode-demo/ stake of 42)
@@ -72,10 +73,9 @@ cd ~/solana
 source scripts/oom-score-adj.sh
 
 now=\$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-ln -sfT fullnode.log.\$now fullnode.log
+ln -sfT validator.log.\$now validator.log
 EOF
 chmod +x ~/solana/on-reboot
-echo "@reboot ~/solana/on-reboot" | crontab -
 
 GPU_CUDA_OK=false
 GPU_FAIL_IF_NONE=false
@@ -100,18 +100,19 @@ case "$gpuMode" in
 esac
 
 waitForNodeToInit() {
-  echo "--- waiting for node to boot up"
+  hostname=$(hostname)
+  echo "--- waiting for $hostname to boot up"
   SECONDS=
   while [[ ! -r $initCompleteFile ]]; do
-    if [[ $SECONDS -ge 120 ]]; then
+    if [[ $SECONDS -ge 240 ]]; then
       echo "^^^ +++"
       echo "Error: $initCompleteFile not found in $SECONDS seconds"
       exit 1
     fi
-    echo "Waiting for $initCompleteFile ($SECONDS)..."
+    echo "Waiting for $initCompleteFile ($SECONDS) on $hostname..."
     sleep 5
   done
-  echo "Node booted up"
+  echo "$hostname booted up"
 }
 
 case $deployMethod in
@@ -136,6 +137,10 @@ cat >> ~/solana/on-reboot <<EOF
   echo \$! > fd-monitor.pid
   scripts/net-stats.sh  > net-stats.log 2>&1 &
   echo \$! > net-stats.pid
+  scripts/iftop.sh  > iftop.log 2>&1 &
+  echo \$! > iftop.pid
+  scripts/system-stats.sh  > system-stats.log 2>&1 &
+  echo \$! > system-stats.pid
 
   if ${GPU_CUDA_OK} && [[ -e /dev/nvidia0 ]]; then
     echo Selecting solana-validator-cuda
@@ -153,19 +158,32 @@ EOF
       clear_config_dir "$SOLANA_CONFIG_DIR"
 
       if [[ -n $internalNodesLamports ]]; then
-        echo "---" >> config/fullnode-balances.yml
-        for i in $(seq 0 "$numNodes"); do
-          solana-keygen new -o config/fullnode-"$i"-identity.json
-          pubkey="$(solana-keygen pubkey config/fullnode-"$i"-identity.json)"
-          cat >> config/fullnode-balances.yml <<EOF
+        echo "---" >> config/validator-balances.yml
+      fi
+
+      setupValidatorKeypair() {
+        declare name=$1
+        if [[ -f net/keypairs/"$name".json ]]; then
+          cp net/keypairs/"$name".json config/"$name".json
+        else
+          solana-keygen new -o config/"$name".json
+        fi
+        if [[ -n $internalNodesLamports ]]; then
+          declare pubkey
+          pubkey="$(solana-keygen pubkey config/"$name".json)"
+          cat >> config/validator-balances.yml <<EOF
 $pubkey:
   balance: $internalNodesLamports
   owner: 11111111111111111111111111111111
   data:
   executable: false
 EOF
-        done
-      fi
+        fi
+      }
+      for i in $(seq 1 "$numNodes"); do
+        setupValidatorKeypair validator-identity-"$i"
+      done
+      setupValidatorKeypair blockstreamer-identity
 
       lamports_per_signature="42"
       # shellcheck disable=SC2206 # Do not want to quote $genesisOptions
@@ -193,13 +211,13 @@ EOF
         echo "" >> config/client-accounts.yml
       done
       if [[ -f $externalPrimordialAccountsFile ]]; then
-        cat "$externalPrimordialAccountsFile" >> config/fullnode-balances.yml
+        cat "$externalPrimordialAccountsFile" >> config/validator-balances.yml
       fi
-      if [[ -f config/fullnode-balances.yml ]]; then
-        genesisOptions+=" --primordial-accounts-file config/fullnode-balances.yml"
+      if [[ -f config/validator-balances.yml ]]; then
+        genesisOptions+=" --primordial-accounts-file config/validator-balances.yml"
       fi
       if [[ -f config/client-accounts.yml ]]; then
-        genesisOptions+=" --primordial-keypairs-file config/client-accounts.yml"
+        genesisOptions+=" --primordial-accounts-file config/client-accounts.yml"
       fi
 
       args=(
@@ -210,10 +228,18 @@ EOF
       fi
       # shellcheck disable=SC2206 # Do not want to quote $genesisOptions
       args+=($genesisOptions)
+
+      if [[ -f net/keypairs/mint.json ]]; then
+        export FAUCET_KEYPAIR=net/keypairs/mint.json
+      fi
+      if [[ -f net/keypairs/bootstrap-leader-identity.json ]]; then
+        export BOOTSTRAP_LEADER_IDENTITY_KEYPAIR=net/keypairs/bootstrap-leader-identity.json
+      fi
       multinode-demo/setup.sh "${args[@]}"
     fi
     args=(
-      --gossip-port "$entrypointIp":8001
+      --gossip-host "$entrypointIp"
+      --gossip-port 8001
       --init-complete-file "$initCompleteFile"
     )
 
@@ -226,7 +252,7 @@ EOF
     args+=($extraNodeArgs)
 
 cat >> ~/solana/on-reboot <<EOF
-    nohup ./multinode-demo/bootstrap-leader.sh ${args[@]} > fullnode.log.\$now 2>&1 &
+    nohup ./multinode-demo/bootstrap-leader.sh ${args[@]} > validator.log.\$now 2>&1 &
     pid=\$!
     oom_score_adj "\$pid" 1000
     disown
@@ -247,8 +273,14 @@ EOF
     fi
     if [[ $skipSetup != true ]]; then
       clear_config_dir "$SOLANA_CONFIG_DIR"
-      [[ -z $internalNodesLamports ]] || net/scripts/rsync-retry.sh -vPrc \
-      "$entrypointIp":~/solana/config/fullnode-"$nodeIndex"-identity.json config/fullnode-identity.json
+
+      if [[ $nodeType = blockstreamer ]]; then
+        net/scripts/rsync-retry.sh -vPrc \
+          "$entrypointIp":~/solana/config/blockstreamer-identity.json config/validator-identity.json
+      else
+        net/scripts/rsync-retry.sh -vPrc \
+          "$entrypointIp":~/solana/config/validator-identity-"$nodeIndex".json config/validator-identity.json
+      fi
     fi
 
     args=(
@@ -260,6 +292,7 @@ EOF
       args+=(
         --blockstream /tmp/solana-blockstream.sock
         --no-voting
+        --dev-no-sigverify
       )
     else
       args+=(--enable-rpc-exit)
@@ -268,22 +301,25 @@ EOF
       fi
     fi
 
-    if [[ ! -f config/fullnode-identity.json ]]; then
-      solana-keygen new -o config/fullnode-identity.json
+    if [[ ! -f config/validator-identity.json ]]; then
+      solana-keygen new -o config/validator-identity.json
     fi
-    args+=(--identity config/fullnode-identity.json)
+    args+=(--identity-keypair config/validator-identity.json)
 
     if [[ $airdropsEnabled != true ]]; then
       args+=(--no-airdrop)
     fi
 
     set -x
+    # Add the mint keypair to validators for convenient access from tools
+    # like bench-tps and add to blocktreamers to run a drone
+    scp "$entrypointIp":~/solana/config/faucet-keypair.json config/
     if [[ $nodeType = blockstreamer ]]; then
-      # Sneak the mint-keypair.json from the bootstrap leader and run another drone
-      # with it on the blockstreamer node.  Typically the blockstreamer node has
-      # a static IP/DNS name for hosting the blockexplorer web app, and is
-      # a location that somebody would expect to be able to airdrop from
-      scp "$entrypointIp":~/solana/config/mint-keypair.json config/
+      # Run another drone with the mint keypair on the blockstreamer node.
+      # Typically the blockstreamer node has a static IP/DNS name for hosting
+      # the blockexplorer web app, and is a location that somebody would expect
+      # to be able to airdrop from
+      scp "$entrypointIp":~/solana/config/faucet-keypair.json config/
       if [[ $airdropsEnabled = true ]]; then
 cat >> ~/solana/on-reboot <<EOF
         multinode-demo/drone.sh > drone.log 2>&1 &
@@ -299,6 +335,8 @@ EOF
       cat > ~/solana/restart-explorer <<EOF
 #!/bin/bash -ex
       cd ~/solana
+
+      export GEOLOCATION_API_KEY=$GEOLOCATION_API_KEY
 
       if [[ -f blockexplorer.pid ]]; then
         pgid=\$(ps opgid= \$(cat blockexplorer.pid) | tr -d '[:space:]')
@@ -334,7 +372,7 @@ EOF
     # shellcheck disable=SC2206 # Don't want to double quote $extraNodeArgs
     args+=($extraNodeArgs)
 cat >> ~/solana/on-reboot <<EOF
-    nohup multinode-demo/validator.sh ${args[@]} > fullnode.log.\$now 2>&1 &
+    nohup multinode-demo/validator.sh ${args[@]} > validator.log.\$now 2>&1 &
     pid=\$!
     oom_score_adj "\$pid" 1000
     disown
@@ -343,16 +381,19 @@ EOF
     waitForNodeToInit
 
     if [[ $skipSetup != true && $nodeType != blockstreamer ]]; then
+      # Wait for the validator to catch up to the bootstrap leader before
+      # delegating stake to it
+      solana --url http://"$entrypointIp":8899 catchup config/validator-identity.json
+
       args=(
         --url http://"$entrypointIp":8899
-        --force
         "$stake"
       )
       if [[ $airdropsEnabled != true ]]; then
         args+=(--no-airdrop)
       fi
-      if [[ -f config/fullnode-identity.json ]]; then
-        args+=(--keypair config/fullnode-identity.json)
+      if [[ -f config/validator-identity.json ]]; then
+        args+=(--keypair config/validator-identity.json)
       fi
 
       multinode-demo/delegate-stake.sh "${args[@]}"
@@ -360,11 +401,11 @@ EOF
 
     if [[ $skipSetup != true ]]; then
       solana --url http://"$entrypointIp":8899 \
-        --keypair config/fullnode-identity.json \
+        --keypair config/validator-identity.json \
         validator-info publish "$(hostname)" -n team/solana --force || true
     fi
     ;;
-  replicator)
+  archiver)
     if [[ $deployMethod != skip ]]; then
       net/scripts/rsync-retry.sh -vPrc "$entrypointIp":~/.cargo/bin/ ~/.cargo/bin/
     fi
@@ -374,14 +415,14 @@ EOF
     )
 
     if [[ $airdropsEnabled != true ]]; then
-      echo "TODO: replicators not supported without airdrops"
-      # TODO: need to provide the `--identity` argument to an existing system
-      #       account with lamports in it
+      # If this ever becomes a problem, we need to provide the `--identity-keypair`
+      # argument to an existing system account with lamports in it
+      echo "Error: archivers not supported without airdrops"
       exit 1
     fi
 
 cat >> ~/solana/on-reboot <<EOF
-    nohup multinode-demo/replicator.sh ${args[@]} > fullnode.log.\$now 2>&1 &
+    nohup multinode-demo/archiver.sh ${args[@]} > validator.log.\$now 2>&1 &
     pid=\$!
     oom_score_adj "\$pid" 1000
     disown
@@ -399,4 +440,3 @@ EOF
   echo "Unknown deployment method: $deployMethod"
   exit 1
 esac
-

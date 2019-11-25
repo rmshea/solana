@@ -10,11 +10,11 @@
 //! For Entries:
 //! * recorded entry must be >= WorkingBank::min_tick_height && entry must be < WorkingBank::max_tick_height
 //!
-use crate::blocktree::Blocktree;
-use crate::entry::Entry;
-use crate::leader_schedule_cache::LeaderScheduleCache;
-use crate::poh::Poh;
 use crate::result::{Error, Result};
+use solana_ledger::blocktree::Blocktree;
+use solana_ledger::entry::Entry;
+use solana_ledger::leader_schedule_cache::LeaderScheduleCache;
+use solana_ledger::poh::Poh;
 use solana_runtime::bank::Bank;
 pub use solana_sdk::clock::Slot;
 use solana_sdk::clock::NUM_CONSECUTIVE_LEADER_SLOTS;
@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const GRACE_TICKS_FACTOR: u64 = 2;
-const MAX_GRACE_TICKS: u64 = 12;
+const MAX_GRACE_SLOTS: u64 = 3;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum PohRecorderError {
@@ -100,14 +100,14 @@ impl PohRecorder {
                 })
     }
 
-    pub fn leader_after_slots(&self, slots: u64) -> Option<Pubkey> {
+    pub fn leader_after_n_slots(&self, slots: u64) -> Option<Pubkey> {
         let current_slot = self.tick_height.saturating_sub(1) / self.ticks_per_slot;
         self.leader_schedule_cache
             .slot_leader_at(current_slot + slots, None)
     }
 
     pub fn next_slot_leader(&self) -> Option<Pubkey> {
-        self.leader_after_slots(1)
+        self.leader_after_n_slots(1)
     }
 
     pub fn bank(&self) -> Option<Arc<Bank>> {
@@ -173,7 +173,7 @@ impl PohRecorder {
                 let last_tick_height = (last_slot + 1) * ticks_per_slot;
                 let num_slots = last_slot - first_slot + 1;
                 let grace_ticks = cmp::min(
-                    MAX_GRACE_TICKS,
+                    ticks_per_slot * MAX_GRACE_SLOTS,
                     ticks_per_slot * num_slots / GRACE_TICKS_FACTOR,
                 );
                 (
@@ -186,7 +186,7 @@ impl PohRecorder {
                 None,
                 0,
                 cmp::min(
-                    MAX_GRACE_TICKS,
+                    ticks_per_slot * MAX_GRACE_SLOTS,
                     ticks_per_slot * NUM_CONSECUTIVE_LEADER_SLOTS / GRACE_TICKS_FACTOR,
                 ),
             ))
@@ -313,7 +313,7 @@ impl PohRecorder {
         let poh_entry = self.poh.lock().unwrap().tick();
         inc_new_counter_warn!(
             "poh_recorder-tick_lock_contention",
-            timing::duration_as_ms(&now.elapsed()) as usize
+            timing::duration_as_us(&now.elapsed()) as usize
         );
         let now = Instant::now();
         if let Some(poh_entry) = poh_entry {
@@ -323,7 +323,7 @@ impl PohRecorder {
             if self.leader_first_tick_height.is_none() {
                 inc_new_counter_warn!(
                     "poh_recorder-tick_overhead",
-                    timing::duration_as_ms(&now.elapsed()) as usize
+                    timing::duration_as_us(&now.elapsed()) as usize
                 );
                 return;
             }
@@ -339,7 +339,7 @@ impl PohRecorder {
         }
         inc_new_counter_warn!(
             "poh_recorder-tick_overhead",
-            timing::duration_as_ms(&now.elapsed()) as usize
+            timing::duration_as_us(&now.elapsed()) as usize
         );
     }
 
@@ -363,20 +363,29 @@ impl PohRecorder {
                 return Err(Error::PohRecorderError(PohRecorderError::MaxHeightReached));
             }
 
-            let now = Instant::now();
-            if let Some(poh_entry) = self.poh.lock().unwrap().record(mixin) {
+            {
+                let now = Instant::now();
+                let mut poh_lock = self.poh.lock().unwrap();
                 inc_new_counter_warn!(
                     "poh_recorder-record_lock_contention",
-                    timing::duration_as_ms(&now.elapsed()) as usize
+                    timing::duration_as_us(&now.elapsed()) as usize
                 );
-                let entry = Entry {
-                    num_hashes: poh_entry.num_hashes,
-                    hash: poh_entry.hash,
-                    transactions,
-                };
-                self.sender
-                    .send((working_bank.bank.clone(), (entry, self.tick_height)))?;
-                return Ok(());
+                let now = Instant::now();
+                let res = poh_lock.record(mixin);
+                inc_new_counter_warn!(
+                    "poh_recorder-record_ms",
+                    timing::duration_as_us(&now.elapsed()) as usize
+                );
+                if let Some(poh_entry) = res {
+                    let entry = Entry {
+                        num_hashes: poh_entry.num_hashes,
+                        hash: poh_entry.hash,
+                        transactions,
+                    };
+                    self.sender
+                        .send((working_bank.bank.clone(), (entry, self.tick_height)))?;
+                    return Ok(());
+                }
             }
             // record() might fail if the next PoH hash needs to be a tick.  But that's ok, tick()
             // and re-record()
@@ -459,9 +468,9 @@ impl PohRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocktree::{get_tmp_ledger_path, Blocktree};
-    use crate::genesis_utils::{create_genesis_block, GenesisBlockInfo};
-    use crate::test_tx::test_tx;
+    use crate::genesis_utils::{create_genesis_config, GenesisConfigInfo};
+    use solana_ledger::{blocktree::Blocktree, get_tmp_ledger_path};
+    use solana_perf::test_tx::test_tx;
     use solana_sdk::clock::DEFAULT_TICKS_PER_SLOT;
     use solana_sdk::hash::hash;
     use std::sync::mpsc::sync_channel;
@@ -552,8 +561,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
                 0,
@@ -586,8 +595,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, entry_receiver) = PohRecorder::new(
                 0,
@@ -635,8 +644,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, entry_receiver) = PohRecorder::new(
                 0,
@@ -682,8 +691,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, entry_receiver) = PohRecorder::new(
                 0,
@@ -720,8 +729,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
                 0,
@@ -760,8 +769,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, entry_receiver) = PohRecorder::new(
                 0,
@@ -806,8 +815,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, entry_receiver) = PohRecorder::new(
                 0,
@@ -850,8 +859,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, entry_receiver) = PohRecorder::new(
                 0,
@@ -963,7 +972,7 @@ mod tests {
             poh_recorder.reset(hash(b"hello"), 0, Some((4, 4))); // parent slot 0 implies tick_height of 3
             assert_eq!(poh_recorder.tick_cache.len(), 0);
             poh_recorder.tick();
-            assert_eq!(poh_recorder.tick_height, 5);
+            assert_eq!(poh_recorder.tick_height, DEFAULT_TICKS_PER_SLOT + 1);
         }
         Blocktree::destroy(&ledger_path).unwrap();
     }
@@ -974,8 +983,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
                 0,
                 Hash::default(),
@@ -1005,8 +1014,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let (sender, receiver) = sync_channel(1);
             let (mut poh_recorder, _entry_receiver) = PohRecorder::new_with_clear_signal(
                 0,
@@ -1035,11 +1044,11 @@ mod tests {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
             let ticks_per_slot = 5;
-            let GenesisBlockInfo {
-                mut genesis_block, ..
-            } = create_genesis_block(2);
-            genesis_block.ticks_per_slot = ticks_per_slot;
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo {
+                mut genesis_config, ..
+            } = create_genesis_config(2);
+            genesis_config.ticks_per_slot = ticks_per_slot;
+            let bank = Arc::new(Bank::new(&genesis_config));
 
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
@@ -1087,8 +1096,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
                 0,
@@ -1207,8 +1216,8 @@ mod tests {
         {
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
             let prev_hash = bank.last_blockhash();
             let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
                 0,
@@ -1274,9 +1283,9 @@ mod tests {
             // test that virtual ticks are flushed into a newly set bank asap
             let blocktree =
                 Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
-            let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-            let bank = Arc::new(Bank::new(&genesis_block));
-            let genesis_blockhash = bank.last_blockhash();
+            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+            let bank = Arc::new(Bank::new(&genesis_config));
+            let genesis_hash = bank.last_blockhash();
 
             let (mut poh_recorder, _entry_receiver) = PohRecorder::new(
                 0,
@@ -1296,7 +1305,7 @@ mod tests {
                 poh_recorder.tick();
             }
             poh_recorder.set_bank(&bank.clone());
-            assert!(!bank.check_hash_age(&genesis_blockhash, 1));
+            assert!(!bank.check_hash_age(&genesis_hash, 1));
         }
     }
 
@@ -1314,7 +1323,7 @@ mod tests {
 
         assert_eq!(
             PohRecorder::compute_leader_slot_tick_heights(Some((4, 7)), 8),
-            (Some(45), 64, MAX_GRACE_TICKS)
+            (Some(49), 64, 2 * 8)
         );
 
         assert_eq!(

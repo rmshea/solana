@@ -74,6 +74,12 @@ solana-bench-exchange)
       --read-client-keys ./client-accounts.yml \
   "
   ;;
+idle)
+  # Add the mint keypair to idle clients for convenience
+  net/scripts/rsync-retry.sh -vPrc \
+    "$entrypointIp":~/solana/config/faucet-keypair.json ~/solana/
+  exit 0
+  ;;
 *)
   echo "Unknown client name: $clientToRun"
   exit 1

@@ -1,49 +1,62 @@
 //! The `validator` module hosts all the validator microservices.
 
-use crate::bank_forks::{BankForks, SnapshotConfig};
-use crate::blocktree::{Blocktree, CompletedSlotsReceiver};
-use crate::blocktree_processor::{self, BankForksInfo};
-use crate::broadcast_stage::BroadcastStageType;
-use crate::cluster_info::{ClusterInfo, Node};
-use crate::confidence::ForkConfidenceCache;
-use crate::contact_info::ContactInfo;
-use crate::gossip_service::{discover_cluster, GossipService};
-use crate::leader_schedule_cache::LeaderScheduleCache;
-use crate::poh_recorder::PohRecorder;
-use crate::poh_service::PohService;
-use crate::rpc::JsonRpcConfig;
-use crate::rpc_pubsub_service::PubSubService;
-use crate::rpc_service::JsonRpcService;
-use crate::rpc_subscriptions::RpcSubscriptions;
-use crate::service::Service;
-use crate::sigverify;
-use crate::snapshot_utils;
-use crate::storage_stage::StorageState;
-use crate::tpu::Tpu;
-use crate::tvu::{Sockets, Tvu};
+use crate::{
+    broadcast_stage::BroadcastStageType,
+    cluster_info::{ClusterInfo, Node},
+    commitment::BlockCommitmentCache,
+    contact_info::ContactInfo,
+    gossip_service::{discover_cluster, GossipService},
+    partition_cfg::PartitionCfg,
+    poh_recorder::PohRecorder,
+    poh_service::PohService,
+    rpc::JsonRpcConfig,
+    rpc_pubsub_service::PubSubService,
+    rpc_service::JsonRpcService,
+    rpc_subscriptions::RpcSubscriptions,
+    sigverify,
+    storage_stage::StorageState,
+    tpu::Tpu,
+    transaction_status_service::TransactionStatusService,
+    tvu::{Sockets, Tvu},
+};
+use crossbeam_channel::unbounded;
+use solana_ledger::{
+    bank_forks::{BankForks, SnapshotConfig},
+    bank_forks_utils,
+    blocktree::{Blocktree, CompletedSlotsReceiver},
+    blocktree_processor::{self, BankForksInfo},
+    create_new_tmp_ledger,
+    leader_schedule_cache::LeaderScheduleCache,
+};
 use solana_metrics::datapoint_info;
-use solana_sdk::clock::{Slot, DEFAULT_SLOTS_PER_TURN};
-use solana_sdk::genesis_block::GenesisBlock;
-use solana_sdk::hash::Hash;
-use solana_sdk::poh_config::PohConfig;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, KeypairUtil};
-use solana_sdk::timing::timestamp;
+use solana_sdk::{
+    clock::{Slot, DEFAULT_SLOTS_PER_TURN},
+    genesis_config::GenesisConfig,
+    hash::Hash,
+    poh_config::PohConfig,
+    pubkey::Pubkey,
+    signature::{Keypair, KeypairUtil},
+    timing::timestamp,
+};
 
-use std::fs;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread::Result;
+use solana_ledger::shred::Shred;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
+    process,
+    sync::atomic::{AtomicBool, Ordering},
+    sync::mpsc::Receiver,
+    sync::{Arc, Mutex, RwLock},
+    thread::Result,
+};
 
 #[derive(Clone, Debug)]
 pub struct ValidatorConfig {
     pub dev_sigverify_disabled: bool,
     pub dev_halt_at_slot: Option<Slot>,
-    pub expected_genesis_blockhash: Option<Hash>,
+    pub expected_genesis_hash: Option<Hash>,
     pub voting_disabled: bool,
+    pub transaction_status_service_disabled: bool,
     pub blockstream_unix_socket: Option<PathBuf>,
     pub storage_slots_per_turn: u64,
     pub account_paths: Option<String>,
@@ -51,6 +64,7 @@ pub struct ValidatorConfig {
     pub snapshot_config: Option<SnapshotConfig>,
     pub max_ledger_slots: Option<u64>,
     pub broadcast_stage_type: BroadcastStageType,
+    pub partition_cfg: Option<PartitionCfg>,
 }
 
 impl Default for ValidatorConfig {
@@ -58,8 +72,9 @@ impl Default for ValidatorConfig {
         Self {
             dev_sigverify_disabled: false,
             dev_halt_at_slot: None,
-            expected_genesis_blockhash: None,
+            expected_genesis_hash: None,
             voting_disabled: false,
+            transaction_status_service_disabled: false,
             blockstream_unix_socket: None,
             storage_slots_per_turn: DEFAULT_SLOTS_PER_TURN,
             max_ledger_slots: None,
@@ -67,6 +82,7 @@ impl Default for ValidatorConfig {
             rpc_config: JsonRpcConfig::default(),
             snapshot_config: None,
             broadcast_stage_type: BroadcastStageType::Standard,
+            partition_cfg: None,
         }
     }
 }
@@ -93,12 +109,13 @@ pub struct Validator {
     validator_exit: Arc<RwLock<Option<ValidatorExit>>>,
     rpc_service: Option<JsonRpcService>,
     rpc_pubsub_service: Option<PubSubService>,
+    transaction_status_service: Option<TransactionStatusService>,
     gossip_service: GossipService,
     poh_recorder: Arc<Mutex<PohRecorder>>,
     poh_service: PohService,
     tpu: Tpu,
     tvu: Tvu,
-    ip_echo_server: solana_netutil::IpEchoServer,
+    ip_echo_server: solana_net_utils::IpEchoServer,
 }
 
 impl Validator {
@@ -110,7 +127,7 @@ impl Validator {
         voting_keypair: &Arc<Keypair>,
         storage_keypair: &Arc<Keypair>,
         entrypoint_info_option: Option<&ContactInfo>,
-        verify_ledger: bool,
+        poh_verify: bool,
         config: &ValidatorConfig,
     ) -> Self {
         let id = keypair.pubkey();
@@ -120,12 +137,26 @@ impl Validator {
         warn!("vote pubkey: {:?}", vote_account);
         warn!(
             "CUDA is {}abled",
-            if crate::perf_libs::api().is_some() {
+            if solana_perf::perf_libs::api().is_some() {
                 "en"
             } else {
                 "dis"
             }
         );
+
+        // Validator binaries built on a machine with AVX support will generate invalid opcodes
+        // when run on machines without AVX causing a non-obvious process abort.  Instead detect
+        // the mismatch and error cleanly.
+        #[target_feature(enable = "avx")]
+        {
+            if is_x86_feature_detected!("avx") {
+                info!("AVX detected");
+            } else {
+                error!("Your machine does not have AVX support, please rebuild from source on your machine");
+                process::exit(1);
+            }
+        }
+
         info!("entrypoint: {:?}", entrypoint_info_option);
 
         Self::print_node_info(&node);
@@ -136,7 +167,7 @@ impl Validator {
 
         info!("creating bank...");
         let (
-            genesis_blockhash,
+            genesis_hash,
             bank_forks,
             bank_forks_info,
             blocktree,
@@ -145,11 +176,11 @@ impl Validator {
             leader_schedule_cache,
             poh_config,
         ) = new_banks_from_blocktree(
-            config.expected_genesis_blockhash,
+            config.expected_genesis_hash,
             ledger_path,
             config.account_paths.clone(),
             config.snapshot_config.clone(),
-            verify_ledger,
+            poh_verify,
             config.dev_halt_at_slot,
         );
 
@@ -158,7 +189,9 @@ impl Validator {
         let bank_info = &bank_forks_info[0];
         let bank = bank_forks[bank_info.bank_slot].clone();
         let bank_forks = Arc::new(RwLock::new(bank_forks));
-        let fork_confidence_cache = Arc::new(RwLock::new(ForkConfidenceCache::default()));
+        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
+        // The version used by shreds, derived from genesis
+        let shred_version = Shred::version_from_hash(&genesis_hash);
 
         let mut validator_exit = ValidatorExit::default();
         let exit_ = exit.clone();
@@ -177,18 +210,21 @@ impl Validator {
             bank.slots_per_segment(),
         );
 
+        let blocktree = Arc::new(blocktree);
+
         let rpc_service = if node.info.rpc.port() == 0 {
             None
         } else {
             Some(JsonRpcService::new(
-                &cluster_info,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), node.info.rpc.port()),
-                storage_state.clone(),
                 config.rpc_config.clone(),
                 bank_forks.clone(),
-                fork_confidence_cache.clone(),
+                block_commitment_cache.clone(),
+                blocktree.clone(),
+                &cluster_info,
+                genesis_hash,
                 ledger_path,
-                genesis_blockhash,
+                storage_state.clone(),
                 &validator_exit,
             ))
         };
@@ -207,6 +243,21 @@ impl Validator {
             ))
         };
 
+        let (transaction_status_sender, transaction_status_service) =
+            if rpc_service.is_some() && !config.transaction_status_service_disabled {
+                let (transaction_status_sender, transaction_status_receiver) = unbounded();
+                (
+                    Some(transaction_status_sender),
+                    Some(TransactionStatusService::new(
+                        transaction_status_receiver,
+                        blocktree.clone(),
+                        &exit,
+                    )),
+                )
+            } else {
+                (None, None)
+            };
+
         info!(
             "Starting PoH: epoch={} slot={} tick_height={} blockhash={} leader={:?}",
             bank.epoch(),
@@ -221,8 +272,6 @@ impl Validator {
             warn!("Validator halted");
             std::thread::park();
         }
-
-        let blocktree = Arc::new(blocktree);
 
         let poh_config = Arc::new(poh_config);
         let (mut poh_recorder, entry_receiver) = PohRecorder::new_with_clear_signal(
@@ -246,10 +295,10 @@ impl Validator {
         assert_eq!(
             blocktree.new_shreds_signals.len(),
             1,
-            "New blob signal for the TVU should be the same as the clear bank signal."
+            "New shred signal for the TVU should be the same as the clear bank signal."
         );
 
-        let ip_echo_server = solana_netutil::ip_echo_server(node.sockets.ip_echo.unwrap());
+        let ip_echo_server = solana_net_utils::ip_echo_server(node.sockets.ip_echo.unwrap());
 
         let gossip_service = GossipService::new(
             &cluster_info,
@@ -317,7 +366,11 @@ impl Validator {
             &leader_schedule_cache,
             &exit,
             completed_slots_receiver,
-            fork_confidence_cache,
+            block_commitment_cache,
+            config.dev_sigverify_disabled,
+            config.partition_cfg.clone(),
+            shred_version,
+            transaction_status_sender.clone(),
         );
 
         if config.dev_sigverify_disabled {
@@ -332,9 +385,11 @@ impl Validator {
             node.sockets.tpu_forwards,
             node.sockets.broadcast,
             config.dev_sigverify_disabled,
+            transaction_status_sender,
             &blocktree,
             &config.broadcast_stage_type,
             &exit,
+            shred_version,
         );
 
         datapoint_info!("validator-new", ("id", id.to_string(), String));
@@ -343,6 +398,7 @@ impl Validator {
             gossip_service,
             rpc_service,
             rpc_pubsub_service,
+            transaction_status_service,
             tpu,
             tvu,
             poh_service,
@@ -383,179 +439,8 @@ impl Validator {
             node.sockets.retransmit_sockets[0].local_addr().unwrap()
         );
     }
-}
 
-fn get_bank_forks(
-    genesis_block: &GenesisBlock,
-    blocktree: &Blocktree,
-    account_paths: Option<String>,
-    snapshot_config: Option<&SnapshotConfig>,
-    verify_ledger: bool,
-    dev_halt_at_slot: Option<Slot>,
-) -> (BankForks, Vec<BankForksInfo>, LeaderScheduleCache) {
-    if let Some(snapshot_config) = snapshot_config.as_ref() {
-        info!(
-            "Initializing snapshot path: {:?}",
-            snapshot_config.snapshot_path
-        );
-        let _ = fs::remove_dir_all(&snapshot_config.snapshot_path);
-        fs::create_dir_all(&snapshot_config.snapshot_path)
-            .expect("Couldn't create snapshot directory");
-
-        let tar =
-            snapshot_utils::get_snapshot_tar_path(&snapshot_config.snapshot_package_output_path);
-        if tar.exists() {
-            info!("Loading snapshot package: {:?}", tar);
-            // Fail hard here if snapshot fails to load, don't silently continue
-            let deserialized_bank = snapshot_utils::bank_from_archive(
-                account_paths
-                    .clone()
-                    .expect("Account paths not present when booting from snapshot"),
-                snapshot_config,
-                &tar,
-            )
-            .expect("Load from snapshot failed");
-
-            return blocktree_processor::process_blocktree_from_root(
-                blocktree,
-                Arc::new(deserialized_bank),
-                &blocktree_processor::ProcessOptions {
-                    verify_ledger,
-                    dev_halt_at_slot,
-                    ..blocktree_processor::ProcessOptions::default()
-                },
-            )
-            .expect("processing blocktree after loading snapshot failed");
-        } else {
-            info!("Snapshot package does not exist: {:?}", tar);
-        }
-    } else {
-        info!("Snapshots disabled");
-    }
-
-    info!("Processing ledger from genesis");
-    blocktree_processor::process_blocktree(
-        &genesis_block,
-        &blocktree,
-        account_paths,
-        blocktree_processor::ProcessOptions {
-            verify_ledger,
-            dev_halt_at_slot,
-            ..blocktree_processor::ProcessOptions::default()
-        },
-    )
-    .expect("process_blocktree failed")
-}
-
-#[cfg(not(unix))]
-fn adjust_ulimit_nofile() {}
-
-#[cfg(unix)]
-fn adjust_ulimit_nofile() {
-    // Rocks DB likes to have many open files.  The default open file descriptor limit is
-    // usually not enough
-    let desired_nofile = 65000;
-
-    fn get_nofile() -> libc::rlimit {
-        let mut nofile = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut nofile) } != 0 {
-            warn!("getrlimit(RLIMIT_NOFILE) failed");
-        }
-        nofile
-    }
-
-    let mut nofile = get_nofile();
-    if nofile.rlim_cur < desired_nofile {
-        nofile.rlim_cur = desired_nofile;
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) } != 0 {
-            error!(
-                "Unable to increase the maximum open file descriptor limit to {}",
-                desired_nofile
-            );
-
-            if cfg!(target_os = "macos") {
-                error!("On mac OS you may need to run |sudo launchctl limit maxfiles 65536 200000| first");
-            }
-        }
-
-        nofile = get_nofile();
-    }
-    info!("Maximum open file descriptors: {}", nofile.rlim_cur);
-}
-
-pub fn new_banks_from_blocktree(
-    expected_genesis_blockhash: Option<Hash>,
-    blocktree_path: &Path,
-    account_paths: Option<String>,
-    snapshot_config: Option<SnapshotConfig>,
-    verify_ledger: bool,
-    dev_halt_at_slot: Option<Slot>,
-) -> (
-    Hash,
-    BankForks,
-    Vec<BankForksInfo>,
-    Blocktree,
-    Receiver<bool>,
-    CompletedSlotsReceiver,
-    LeaderScheduleCache,
-    PohConfig,
-) {
-    let genesis_block = GenesisBlock::load(blocktree_path).expect("Failed to load genesis block");
-    let genesis_blockhash = genesis_block.hash();
-    info!("genesis blockhash: {}", genesis_blockhash);
-
-    if let Some(expected_genesis_blockhash) = expected_genesis_blockhash {
-        if genesis_blockhash != expected_genesis_blockhash {
-            error!(
-                "genesis blockhash mismatch: expected {}",
-                expected_genesis_blockhash
-            );
-            error!(
-                "Delete the ledger directory to continue: {:?}",
-                blocktree_path
-            );
-            // TODO: bubble error up to caller?
-            std::process::exit(1);
-        }
-    }
-
-    adjust_ulimit_nofile();
-
-    let (blocktree, ledger_signal_receiver, completed_slots_receiver) =
-        Blocktree::open_with_signal(blocktree_path).expect("Failed to open ledger database");
-
-    let (mut bank_forks, bank_forks_info, leader_schedule_cache) = get_bank_forks(
-        &genesis_block,
-        &blocktree,
-        account_paths,
-        snapshot_config.as_ref(),
-        verify_ledger,
-        dev_halt_at_slot,
-    );
-
-    if let Some(snapshot_config) = snapshot_config {
-        bank_forks.set_snapshot_config(snapshot_config);
-    }
-
-    (
-        genesis_blockhash,
-        bank_forks,
-        bank_forks_info,
-        blocktree,
-        ledger_signal_receiver,
-        completed_slots_receiver,
-        leader_schedule_cache,
-        genesis_block.poh_config,
-    )
-}
-
-impl Service for Validator {
-    type JoinReturnType = ();
-
-    fn join(self) -> Result<()> {
+    pub fn join(self) -> Result<()> {
         self.poh_service.join()?;
         drop(self.poh_recorder);
         if let Some(rpc_service) = self.rpc_service {
@@ -563,6 +448,9 @@ impl Service for Validator {
         }
         if let Some(rpc_pubsub_service) = self.rpc_pubsub_service {
             rpc_pubsub_service.join()?;
+        }
+        if let Some(transaction_status_service) = self.transaction_status_service {
+            transaction_status_service.join()?;
         }
 
         self.gossip_service.join()?;
@@ -574,40 +462,111 @@ impl Service for Validator {
     }
 }
 
+pub fn new_banks_from_blocktree(
+    expected_genesis_hash: Option<Hash>,
+    blocktree_path: &Path,
+    account_paths: Option<String>,
+    snapshot_config: Option<SnapshotConfig>,
+    poh_verify: bool,
+    dev_halt_at_slot: Option<Slot>,
+) -> (
+    Hash,
+    BankForks,
+    Vec<BankForksInfo>,
+    Blocktree,
+    Receiver<bool>,
+    CompletedSlotsReceiver,
+    LeaderScheduleCache,
+    PohConfig,
+) {
+    let genesis_config = GenesisConfig::load(blocktree_path).unwrap_or_else(|err| {
+        error!("Failed to load genesis from {:?}: {}", blocktree_path, err);
+        process::exit(1);
+    });
+    let genesis_hash = genesis_config.hash();
+    info!("genesis hash: {}", genesis_hash);
+
+    if let Some(expected_genesis_hash) = expected_genesis_hash {
+        if genesis_hash != expected_genesis_hash {
+            error!("genesis hash mismatch: expected {}", expected_genesis_hash);
+            error!(
+                "Delete the ledger directory to continue: {:?}",
+                blocktree_path
+            );
+            process::exit(1);
+        }
+    }
+
+    let (blocktree, ledger_signal_receiver, completed_slots_receiver) =
+        Blocktree::open_with_signal(blocktree_path).expect("Failed to open ledger database");
+
+    let process_options = blocktree_processor::ProcessOptions {
+        poh_verify,
+        dev_halt_at_slot,
+        ..blocktree_processor::ProcessOptions::default()
+    };
+
+    let (mut bank_forks, bank_forks_info, leader_schedule_cache) = bank_forks_utils::load(
+        &genesis_config,
+        &blocktree,
+        account_paths,
+        snapshot_config.as_ref(),
+        process_options,
+    )
+    .unwrap_or_else(|err| {
+        error!("Failed to load ledger: {:?}", err);
+        std::process::exit(1);
+    });
+
+    bank_forks.set_snapshot_config(snapshot_config);
+
+    (
+        genesis_hash,
+        bank_forks,
+        bank_forks_info,
+        blocktree,
+        ledger_signal_receiver,
+        completed_slots_receiver,
+        leader_schedule_cache,
+        genesis_config.poh_config,
+    )
+}
+
 pub fn new_validator_for_tests() -> (Validator, ContactInfo, Keypair, PathBuf) {
-    use crate::blocktree::create_new_tmp_ledger;
-    use crate::genesis_utils::{create_genesis_block_with_leader, GenesisBlockInfo};
+    use crate::genesis_utils::{create_genesis_config_with_leader, GenesisConfigInfo};
 
     let node_keypair = Arc::new(Keypair::new());
     let node = Node::new_localhost_with_pubkey(&node_keypair.pubkey());
     let contact_info = node.info.clone();
 
-    let GenesisBlockInfo {
-        mut genesis_block,
+    let GenesisConfigInfo {
+        mut genesis_config,
         mint_keypair,
-        ..
-    } = create_genesis_block_with_leader(10_000, &contact_info.id, 42);
-    genesis_block
+        voting_keypair,
+    } = create_genesis_config_with_leader(1_000_000, &contact_info.id, 42);
+    genesis_config
         .native_instruction_processors
         .push(solana_budget_program!());
 
-    genesis_block.rent_calculator.lamports_per_byte_year = 1;
-    genesis_block.rent_calculator.exemption_threshold = 1.0;
+    genesis_config.rent.lamports_per_byte_year = 1;
+    genesis_config.rent.exemption_threshold = 1.0;
 
-    let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
+    let (ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
 
-    let voting_keypair = Arc::new(Keypair::new());
+    let leader_voting_keypair = Arc::new(voting_keypair);
     let storage_keypair = Arc::new(Keypair::new());
+    let mut config = ValidatorConfig::default();
+    config.transaction_status_service_disabled = true;
     let node = Validator::new(
         node,
         &node_keypair,
         &ledger_path,
-        &voting_keypair.pubkey(),
-        &voting_keypair,
+        &leader_voting_keypair.pubkey(),
+        &leader_voting_keypair,
         &storage_keypair,
         None,
         true,
-        &ValidatorConfig::default(),
+        &config,
     );
     discover_cluster(&contact_info.gossip, 1).expect("Node startup failed");
     (node, contact_info, mint_keypair, ledger_path)
@@ -616,8 +575,7 @@ pub fn new_validator_for_tests() -> (Validator, ContactInfo, Keypair, PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocktree::create_new_tmp_ledger;
-    use crate::genesis_utils::create_genesis_block_with_leader;
+    use crate::genesis_utils::create_genesis_config_with_leader;
     use std::fs::remove_dir_all;
 
     #[test]
@@ -628,12 +586,15 @@ mod tests {
 
         let validator_keypair = Keypair::new();
         let validator_node = Node::new_localhost_with_pubkey(&validator_keypair.pubkey());
-        let genesis_block =
-            create_genesis_block_with_leader(10_000, &leader_keypair.pubkey(), 1000).genesis_block;
-        let (validator_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
+        let genesis_config =
+            create_genesis_config_with_leader(10_000, &leader_keypair.pubkey(), 1000)
+                .genesis_config;
+        let (validator_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
 
         let voting_keypair = Arc::new(Keypair::new());
         let storage_keypair = Arc::new(Keypair::new());
+        let mut config = ValidatorConfig::default();
+        config.transaction_status_service_disabled = true;
         let validator = Validator::new(
             validator_node,
             &Arc::new(validator_keypair),
@@ -643,7 +604,7 @@ mod tests {
             &storage_keypair,
             Some(&leader_node.info),
             true,
-            &ValidatorConfig::default(),
+            &config,
         );
         validator.close().unwrap();
         remove_dir_all(validator_ledger_path).unwrap();
@@ -659,13 +620,15 @@ mod tests {
             .map(|_| {
                 let validator_keypair = Keypair::new();
                 let validator_node = Node::new_localhost_with_pubkey(&validator_keypair.pubkey());
-                let genesis_block =
-                    create_genesis_block_with_leader(10_000, &leader_keypair.pubkey(), 1000)
-                        .genesis_block;
-                let (validator_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_block);
+                let genesis_config =
+                    create_genesis_config_with_leader(10_000, &leader_keypair.pubkey(), 1000)
+                        .genesis_config;
+                let (validator_ledger_path, _blockhash) = create_new_tmp_ledger!(&genesis_config);
                 ledger_paths.push(validator_ledger_path.clone());
                 let voting_keypair = Arc::new(Keypair::new());
                 let storage_keypair = Arc::new(Keypair::new());
+                let mut config = ValidatorConfig::default();
+                config.transaction_status_service_disabled = true;
                 Validator::new(
                     validator_node,
                     &Arc::new(validator_keypair),
@@ -675,7 +638,7 @@ mod tests {
                     &storage_keypair,
                     Some(&leader_node.info),
                     true,
-                    &ValidatorConfig::default(),
+                    &config,
                 )
             })
             .collect();

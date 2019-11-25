@@ -1,17 +1,16 @@
 #![feature(test)]
 use rand;
 
+extern crate solana_ledger;
 extern crate test;
 
-#[macro_use]
-extern crate solana_core;
-
 use rand::Rng;
-use solana_core::{
-    blocktree::{entries_to_test_shreds, get_tmp_ledger_path, Blocktree},
+use solana_ledger::{
+    blocktree::{entries_to_test_shreds, Blocktree},
     entry::{create_ticks, Entry},
+    get_tmp_ledger_path,
 };
-use solana_sdk::hash::Hash;
+use solana_sdk::{clock::Slot, hash::Hash};
 use std::path::Path;
 use test::Bencher;
 
@@ -20,8 +19,8 @@ fn bench_write_shreds(bench: &mut Bencher, entries: Vec<Entry>, ledger_path: &Pa
     let blocktree =
         Blocktree::open(ledger_path).expect("Expected to be able to open database ledger");
     bench.iter(move || {
-        let shreds = entries_to_test_shreds(entries.clone(), 0, 0, true);
-        blocktree.insert_shreds(shreds, None).unwrap();
+        let shreds = entries_to_test_shreds(entries.clone(), 0, 0, true, 0);
+        blocktree.insert_shreds(shreds, None, false).unwrap();
     });
 
     Blocktree::destroy(ledger_path).expect("Expected successful database destruction");
@@ -32,15 +31,19 @@ fn setup_read_bench(
     blocktree: &mut Blocktree,
     num_small_shreds: u64,
     num_large_shreds: u64,
-    slot: u64,
+    slot: Slot,
 ) {
     // Make some big and small entries
-    let entries = create_ticks(num_large_shreds * 4 + num_small_shreds * 2, Hash::default());
+    let entries = create_ticks(
+        num_large_shreds * 4 + num_small_shreds * 2,
+        0,
+        Hash::default(),
+    );
 
     // Convert the entries to shreds, write the shreds to the ledger
-    let shreds = entries_to_test_shreds(entries, slot, slot.saturating_sub(1), true);
+    let shreds = entries_to_test_shreds(entries, slot, slot.saturating_sub(1), true, 0);
     blocktree
-        .insert_shreds(shreds, None)
+        .insert_shreds(shreds, None, false)
         .expect("Expectd successful insertion of shreds into ledger");
 }
 
@@ -50,7 +53,7 @@ fn setup_read_bench(
 fn bench_write_small(bench: &mut Bencher) {
     let ledger_path = get_tmp_ledger_path!();
     let num_entries = 32 * 1024;
-    let entries = create_ticks(num_entries, Hash::default());
+    let entries = create_ticks(num_entries, 0, Hash::default());
     bench_write_shreds(bench, entries, &ledger_path);
 }
 
@@ -60,7 +63,7 @@ fn bench_write_small(bench: &mut Bencher) {
 fn bench_write_big(bench: &mut Bencher) {
     let ledger_path = get_tmp_ledger_path!();
     let num_entries = 32 * 1024;
-    let entries = create_ticks(num_entries, Hash::default());
+    let entries = create_ticks(num_entries, 0, Hash::default());
     bench_write_shreds(bench, entries, &ledger_path);
 }
 
@@ -129,10 +132,10 @@ fn bench_insert_data_shred_small(bench: &mut Bencher) {
     let blocktree =
         Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
     let num_entries = 32 * 1024;
-    let entries = create_ticks(num_entries, Hash::default());
+    let entries = create_ticks(num_entries, 0, Hash::default());
     bench.iter(move || {
-        let shreds = entries_to_test_shreds(entries.clone(), 0, 0, true);
-        blocktree.insert_shreds(shreds, None).unwrap();
+        let shreds = entries_to_test_shreds(entries.clone(), 0, 0, true, 0);
+        blocktree.insert_shreds(shreds, None, false).unwrap();
     });
     Blocktree::destroy(&ledger_path).expect("Expected successful database destruction");
 }
@@ -144,10 +147,10 @@ fn bench_insert_data_shred_big(bench: &mut Bencher) {
     let blocktree =
         Blocktree::open(&ledger_path).expect("Expected to be able to open database ledger");
     let num_entries = 32 * 1024;
-    let entries = create_ticks(num_entries, Hash::default());
+    let entries = create_ticks(num_entries, 0, Hash::default());
     bench.iter(move || {
-        let shreds = entries_to_test_shreds(entries.clone(), 0, 0, true);
-        blocktree.insert_shreds(shreds, None).unwrap();
+        let shreds = entries_to_test_shreds(entries.clone(), 0, 0, true, 0);
+        blocktree.insert_shreds(shreds, None, false).unwrap();
     });
     Blocktree::destroy(&ledger_path).expect("Expected successful database destruction");
 }

@@ -49,9 +49,9 @@ printNode() {
   printf "  %-25s | For logs run: $0 $ip tail -f solana/$nodeType.log\n" "$0 $ip"
 }
 
-echo Full nodes:
-for ipAddress in "${fullnodeIpList[@]}"; do
-  printNode fullnode "$ipAddress"
+echo Validators:
+for ipAddress in "${validatorIpList[@]}"; do
+  printNode validator "$ipAddress"
 done
 echo
 echo Clients:
@@ -68,16 +68,16 @@ if [[ ${#blockstreamerIpList[@]} -eq 0 ]]; then
   echo "  None"
 else
   for ipAddress in "${blockstreamerIpList[@]}"; do
-    printNode fullnode "$ipAddress"
+    printNode validator "$ipAddress"
   done
 fi
 echo
-echo Replicators:
-if [[ ${#replicatorIpList[@]} -eq 0 ]]; then
+echo Archivers:
+if [[ ${#archiverIpList[@]} -eq 0 ]]; then
   echo "  None"
 else
-  for ipAddress in "${replicatorIpList[@]}"; do
-    printNode fullnode "$ipAddress"
+  for ipAddress in "${archiverIpList[@]}"; do
+    printNode validator "$ipAddress"
   done
 fi
 echo

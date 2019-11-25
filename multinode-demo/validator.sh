@@ -23,11 +23,11 @@ OPTIONS:
   --init-complete-file FILE - create this file, if it doesn't already exist, once node initialization is complete
   --label LABEL             - Append the given label to the configuration files, useful when running
                               multiple validators in the same workspace
-  --node-lamports LAMPORTS  - Number of lamports this node has been funded from the genesis block
+  --node-lamports LAMPORTS  - Number of lamports this node has been funded from the genesis config
   --no-voting               - start node without vote signer
   --rpc-port port           - custom RPC port for this node
   --no-restart              - do not restart the node if it exits
-  --no-airdrop              - The genesis block has an account for the node. Airdrops are not required.
+  --no-airdrop              - The genesis config has an account for the node. Airdrops are not required.
 
 EOF
   exit 1
@@ -35,8 +35,7 @@ EOF
 
 args=()
 airdrops_enabled=1
-node_lamports=424242424242  # number of lamports to airdrop the node for transaction fees (ignored if airdrops_enabled=0)
-poll_for_new_genesis_block=0
+node_lamports=500000000000 # 500 SOL: number of lamports to airdrop the node for transaction fees (ignored if airdrops_enabled=0)
 label=
 identity_keypair_path=
 voting_keypair_path=
@@ -54,9 +53,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --no-restart ]]; then
       no_restart=1
       shift
-    elif [[ $1 = --poll-for-new-genesis-block ]]; then
-      poll_for_new_genesis_block=1
-      shift
     elif [[ $1 = --node-lamports ]]; then
       node_lamports="$2"
       shift 2
@@ -67,10 +63,10 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --blockstream ]]; then
       args+=("$1" "$2")
       shift 2
-    elif [[ $1 = --expected-genesis-blockhash ]]; then
+    elif [[ $1 = --expected-genesis-hash ]]; then
       args+=("$1" "$2")
       shift 2
-    elif [[ $1 = --identity ]]; then
+    elif [[ $1 = --identity-keypair ]]; then
       identity_keypair_path=$2
       args+=("$1" "$2")
       shift 2
@@ -95,9 +91,6 @@ while [[ -n $1 ]]; do
       gossip_entrypoint=$2
       args+=("$1" "$2")
       shift 2
-    elif [[ $1 = --limit-ledger-size ]]; then
-      args+=("$1")
-      shift
     elif [[ $1 = --no-snapshot-fetch ]]; then
       args+=("$1")
       shift
@@ -137,9 +130,12 @@ while [[ -n $1 ]]; do
     elif [[ $1 = --limit-ledger-size ]]; then
       args+=("$1")
       shift
-    elif [[ $1 = --skip-ledger-verify ]]; then
+    elif [[ $1 = --skip-poh-verify ]]; then
       args+=("$1")
       shift
+    elif [[ $1 = --log ]]; then
+      args+=("$1" "$2")
+      shift 2
     elif [[ $1 = -h ]]; then
       usage "$@"
     else
@@ -170,7 +166,7 @@ fi
 
 if [[ -n $REQUIRE_KEYPAIRS ]]; then
   if [[ -z $identity_keypair_path ]]; then
-    usage "Error: --identity not specified"
+    usage "Error: --identity-keypair not specified"
   fi
   if [[ -z $voting_keypair_path ]]; then
     usage "Error: --voting-keypair not specified"
@@ -181,8 +177,6 @@ if [[ -z "$ledger_dir" ]]; then
   ledger_dir="$SOLANA_CONFIG_DIR/validator$label"
 fi
 mkdir -p "$ledger_dir"
-
-setup_secondary_mount
 
 if [[ -n $gossip_entrypoint ]]; then
   # Prefer the --entrypoint argument if supplied...
@@ -211,10 +205,11 @@ if ((airdrops_enabled)); then
   default_arg --rpc-drone-address "$drone_address"
 fi
 
-default_arg --identity "$identity_keypair_path"
+default_arg --identity-keypair "$identity_keypair_path"
 default_arg --voting-keypair "$voting_keypair_path"
 default_arg --storage-keypair "$storage_keypair_path"
 default_arg --ledger "$ledger_dir"
+default_arg --log -
 
 if [[ -n $SOLANA_CUDA ]]; then
   program=$solana_validator_cuda
@@ -226,26 +221,6 @@ if [[ -z $CI ]]; then # Skip in CI
   # shellcheck source=scripts/tune-system.sh
   source "$here"/../scripts/tune-system.sh
 fi
-
-new_genesis_block() {
-  if [[ ! -d "$ledger_dir" ]]; then
-    return
-  fi
-
-  rm -f "$ledger_dir"/new-genesis.tar.bz2
-  (
-    set -x
-    curl -f "$rpc_url"/genesis.tar.bz2 -o "$ledger_dir"/new-genesis.tar.bz2
-  ) || {
-    echo "Error: failed to fetch new genesis ledger"
-    rm -f "$ledger_dir"/new-genesis.tar.bz2
-  }
-  if [[ -f "$ledger_dir"/new-genesis.tar.bz2 ]]; then
-    diff -q "$ledger_dir"/new-genesis.tar.bz2 "$ledger_dir"/genesis.tar.bz2 >/dev/null 2>&1 && false
-  else
-    false
-  fi
-}
 
 set -e
 PS4="$(basename "$0"): "
@@ -303,14 +278,15 @@ setup_validator_accounts() {
   return 0
 }
 
+rpc_url=$($solana_gossip get-rpc-url --entrypoint "$gossip_entrypoint")
+
+[[ -r "$identity_keypair_path" ]] || $solana_keygen new -o "$identity_keypair_path"
+[[ -r "$voting_keypair_path" ]] || $solana_keygen new -o "$voting_keypair_path"
+[[ -r "$storage_keypair_path" ]] || $solana_keygen new -o "$storage_keypair_path"
+
+setup_validator_accounts "$node_lamports"
+
 while true; do
-  rpc_url=$($solana_gossip get-rpc-url --entrypoint "$gossip_entrypoint")
-
-  [[ -r "$identity_keypair_path" ]] || $solana_keygen new -o "$identity_keypair_path"
-  [[ -r "$voting_keypair_path" ]] || $solana_keygen new -o "$voting_keypair_path"
-  [[ -r "$storage_keypair_path" ]] || $solana_keygen new -o "$storage_keypair_path"
-
-  setup_validator_accounts "$node_lamports"
   echo "$PS4$program ${args[*]}"
 
   $program "${args[@]}" &
@@ -322,34 +298,13 @@ while true; do
     exit $?
   fi
 
-  secs_to_next_genesis_poll=60
   while true; do
     if [[ -z $pid ]] || ! kill -0 "$pid"; then
       echo "############## validator exited, restarting ##############"
       break
     fi
-
     sleep 1
-
-    if ((poll_for_new_genesis_block && --secs_to_next_genesis_poll == 0)); then
-      echo "Polling for new genesis block..."
-      if new_genesis_block; then
-        echo "############## New genesis detected, restarting ##############"
-        (
-          set -x
-          rm -rf "$ledger_dir"
-        )
-        break
-      fi
-      secs_to_next_genesis_poll=60
-    fi
-
   done
 
   kill_node
-  # give the cluster time to come back up
-  (
-    set -x
-    sleep 60
-  )
 done

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 #
-# This script is to be run on the bootstrap full node
+# This script is to be run on the bootstrap validator
 #
 
 cd "$(dirname "$0")"/../..
@@ -36,5 +36,5 @@ PATH="$HOME"/.cargo/bin:"$PATH"
 
 set -x
 scripts/solana-install-deploy.sh \
-  --keypair config/mint-keypair.json \
+  --keypair config/faucet-keypair.json \
   localhost "$releaseChannel" "$updatePlatform"

@@ -1,27 +1,33 @@
 use crate::{
     cli::{
-        build_balance_message, check_account_for_fee, CliCommand, CliConfig, CliError,
-        ProcessResult,
+        build_balance_message, check_account_for_fee, CliCommand, CliCommandInfo, CliConfig,
+        CliError, ProcessResult,
     },
     display::println_name_value,
 };
 use clap::{value_t_or_exit, App, Arg, ArgMatches, SubCommand};
 use console::{style, Emoji};
-use serde_json::Value;
-use solana_client::rpc_client::RpcClient;
+use indicatif::{ProgressBar, ProgressStyle};
+use solana_clap_utils::{input_parsers::*, input_validators::*};
+use solana_client::{rpc_client::RpcClient, rpc_request::RpcVoteAccountInfo};
 use solana_sdk::{
     clock,
+    commitment_config::CommitmentConfig,
     hash::Hash,
+    pubkey::Pubkey,
     signature::{Keypair, KeypairUtil},
     system_transaction,
 };
 use std::{
     collections::VecDeque,
+    net::SocketAddr,
+    thread::sleep,
     time::{Duration, Instant},
 };
 
 static CHECK_MARK: Emoji = Emoji("✅ ", "");
 static CROSS_MARK: Emoji = Emoji("❌ ", "");
+static WARNING: Emoji = Emoji("⚠️", "!");
 
 pub trait ClusterQuerySubCommands {
     fn cluster_query_subcommands(self) -> Self;
@@ -30,20 +36,59 @@ pub trait ClusterQuerySubCommands {
 impl ClusterQuerySubCommands for App<'_, '_> {
     fn cluster_query_subcommands(self) -> Self {
         self.subcommand(
+            SubCommand::with_name("catchup")
+                .about("Wait for a validator to catch up to the cluster")
+                .arg(
+                    Arg::with_name("node_pubkey")
+                        .index(1)
+                        .takes_value(true)
+                        .value_name("PUBKEY")
+                        .validator(is_pubkey_or_keypair)
+                        .required(true)
+                        .help("Identity pubkey of the validator"),
+                ),
+        )
+        .subcommand(
             SubCommand::with_name("cluster-version")
                 .about("Get the version of the cluster entrypoint"),
         )
         .subcommand(SubCommand::with_name("fees").about("Display current cluster fees"))
         .subcommand(
             SubCommand::with_name("get-epoch-info")
-                .about("Get information about the current epoch"),
+            .about("Get information about the current epoch")
+            .arg(
+                Arg::with_name("confirmed")
+                    .long("confirmed")
+                    .takes_value(false)
+                    .help(
+                        "Return information at maximum-lockout commitment level",
+                    ),
+            ),
         )
         .subcommand(
-            SubCommand::with_name("get-genesis-blockhash").about("Get the genesis blockhash"),
+            SubCommand::with_name("get-genesis-hash").about("Get the genesis hash"),
         )
-        .subcommand(SubCommand::with_name("get-slot").about("Get current slot"))
         .subcommand(
-            SubCommand::with_name("get-transaction-count").about("Get current transaction count"),
+            SubCommand::with_name("get-slot").about("Get current slot")
+            .arg(
+                Arg::with_name("confirmed")
+                    .long("confirmed")
+                    .takes_value(false)
+                    .help(
+                        "Return slot at maximum-lockout commitment level",
+                    ),
+            ),
+        )
+        .subcommand(
+            SubCommand::with_name("get-transaction-count").about("Get current transaction count")
+            .arg(
+                Arg::with_name("confirmed")
+                    .long("confirmed")
+                    .takes_value(false)
+                    .help(
+                        "Return count at maximum-lockout commitment level",
+                    ),
+            ),
         )
         .subcommand(
             SubCommand::with_name("ping")
@@ -66,14 +111,34 @@ impl ClusterQuerySubCommands for App<'_, '_> {
                         .help("Stop after submitting count transactions"),
                 )
                 .arg(
+                    Arg::with_name("lamports")
+                        .long("lamports")
+                        .value_name("NUMBER")
+                        .takes_value(true)
+                        .default_value("1")
+                        .help("Number of lamports to transfer for each transaction"),
+                )
+                .arg(
                     Arg::with_name("timeout")
                         .short("t")
                         .long("timeout")
                         .value_name("SECONDS")
                         .takes_value(true)
-                        .default_value("10")
+                        .default_value("15")
                         .help("Wait up to timeout seconds for transaction confirmation"),
+                )
+                .arg(
+                    Arg::with_name("confirmed")
+                        .long("confirmed")
+                        .takes_value(false)
+                        .help(
+                            "Wait until the transaction is confirmed at maximum-lockout commitment level",
+                        ),
                 ),
+        )
+        .subcommand(
+            SubCommand::with_name("show-gossip")
+                .about("Show the current gossip network nodes"),
         )
         .subcommand(
             SubCommand::with_name("show-validators")
@@ -88,7 +153,16 @@ impl ClusterQuerySubCommands for App<'_, '_> {
     }
 }
 
-pub fn parse_cluster_ping(matches: &ArgMatches<'_>) -> Result<CliCommand, CliError> {
+pub fn parse_catchup(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
+    let node_pubkey = pubkey_of(matches, "node_pubkey").unwrap();
+    Ok(CliCommandInfo {
+        command: CliCommand::Catchup { node_pubkey },
+        require_keypair: false,
+    })
+}
+
+pub fn parse_cluster_ping(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
+    let lamports = value_t_or_exit!(matches, "lamports", u64);
     let interval = Duration::from_secs(value_t_or_exit!(matches, "interval", u64));
     let count = if matches.is_present("count") {
         Some(value_t_or_exit!(matches, "count", u64))
@@ -96,34 +170,138 @@ pub fn parse_cluster_ping(matches: &ArgMatches<'_>) -> Result<CliCommand, CliErr
         None
     };
     let timeout = Duration::from_secs(value_t_or_exit!(matches, "timeout", u64));
-    Ok(CliCommand::Ping {
-        interval,
-        count,
-        timeout,
+    let commitment_config = if matches.is_present("confirmed") {
+        CommitmentConfig::default()
+    } else {
+        CommitmentConfig::recent()
+    };
+    Ok(CliCommandInfo {
+        command: CliCommand::Ping {
+            lamports,
+            interval,
+            count,
+            timeout,
+            commitment_config,
+        },
+        require_keypair: true,
     })
 }
 
-pub fn parse_show_validators(matches: &ArgMatches<'_>) -> Result<CliCommand, CliError> {
-    let use_lamports_unit = matches.is_present("lamports");
-
-    Ok(CliCommand::ShowValidators { use_lamports_unit })
+pub fn parse_get_epoch_info(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
+    let commitment_config = if matches.is_present("confirmed") {
+        CommitmentConfig::default()
+    } else {
+        CommitmentConfig::recent()
+    };
+    Ok(CliCommandInfo {
+        command: CliCommand::GetEpochInfo { commitment_config },
+        require_keypair: false,
+    })
 }
 
-pub fn process_cluster_version(rpc_client: &RpcClient, config: &CliConfig) -> ProcessResult {
-    let remote_version: Value = serde_json::from_str(&rpc_client.get_version()?)?;
-    println!(
-        "{} {}",
-        style("Cluster versions from:").bold(),
-        config.json_rpc_url
-    );
-    if let Some(versions) = remote_version.as_object() {
-        for (key, value) in versions.iter() {
-            if let Some(value_string) = value.as_str() {
-                println_name_value(&format!("* {}:", key), &value_string);
-            }
+pub fn parse_get_slot(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
+    let commitment_config = if matches.is_present("confirmed") {
+        CommitmentConfig::default()
+    } else {
+        CommitmentConfig::recent()
+    };
+    Ok(CliCommandInfo {
+        command: CliCommand::GetSlot { commitment_config },
+        require_keypair: false,
+    })
+}
+
+pub fn parse_get_transaction_count(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
+    let commitment_config = if matches.is_present("confirmed") {
+        CommitmentConfig::default()
+    } else {
+        CommitmentConfig::recent()
+    };
+    Ok(CliCommandInfo {
+        command: CliCommand::GetTransactionCount { commitment_config },
+        require_keypair: false,
+    })
+}
+
+pub fn parse_show_validators(matches: &ArgMatches<'_>) -> Result<CliCommandInfo, CliError> {
+    let use_lamports_unit = matches.is_present("lamports");
+
+    Ok(CliCommandInfo {
+        command: CliCommand::ShowValidators { use_lamports_unit },
+        require_keypair: false,
+    })
+}
+
+/// Creates a new process bar for processing that will take an unknown amount of time
+fn new_spinner_progress_bar() -> ProgressBar {
+    let progress_bar = ProgressBar::new(42);
+    progress_bar
+        .set_style(ProgressStyle::default_spinner().template("{spinner:.green} {wide_msg}"));
+    progress_bar.enable_steady_tick(100);
+    progress_bar
+}
+
+pub fn process_catchup(rpc_client: &RpcClient, node_pubkey: &Pubkey) -> ProcessResult {
+    let cluster_nodes = rpc_client.get_cluster_nodes()?;
+
+    let rpc_addr = cluster_nodes
+        .iter()
+        .find(|contact_info| contact_info.pubkey == node_pubkey.to_string())
+        .ok_or_else(|| format!("Contact information not found for {}", node_pubkey))?
+        .rpc
+        .ok_or_else(|| format!("RPC service not found for {}", node_pubkey))?;
+
+    let progress_bar = new_spinner_progress_bar();
+    progress_bar.set_message("Connecting...");
+
+    let node_client = RpcClient::new_socket(rpc_addr);
+    let mut previous_rpc_slot = std::u64::MAX;
+    let mut previous_slot_distance = 0;
+    let sleep_interval = 5;
+    loop {
+        let rpc_slot = rpc_client.get_slot_with_commitment(CommitmentConfig::recent())?;
+        let node_slot = node_client.get_slot_with_commitment(CommitmentConfig::recent())?;
+        if node_slot > std::cmp::min(previous_rpc_slot, rpc_slot) {
+            progress_bar.finish_and_clear();
+            return Ok(format!(
+                "{} has caught up (us:{} them:{})",
+                node_pubkey, node_slot, rpc_slot,
+            ));
         }
+
+        let slot_distance = rpc_slot as i64 - node_slot as i64;
+        progress_bar.set_message(&format!(
+            "Validator is {} slots away (us:{} them:{}){}",
+            slot_distance,
+            node_slot,
+            rpc_slot,
+            if previous_rpc_slot == std::u64::MAX {
+                "".to_string()
+            } else {
+                let slots_per_second =
+                    (previous_slot_distance - slot_distance) as f64 / f64::from(sleep_interval);
+
+                format!(
+                    " and {} at {:.1} slots/second",
+                    if slots_per_second < 0.0 {
+                        "falling behind"
+                    } else {
+                        "gaining"
+                    },
+                    slots_per_second,
+                )
+            }
+        ));
+
+        sleep(Duration::from_secs(sleep_interval as u64));
+        previous_rpc_slot = rpc_slot;
+        previous_slot_distance = slot_distance;
     }
-    Ok("".to_string())
+}
+
+pub fn process_cluster_version(rpc_client: &RpcClient) -> ProcessResult {
+    let remote_version = rpc_client.get_version()?;
+    Ok(remote_version.solana_core)
 }
 
 pub fn process_fees(rpc_client: &RpcClient) -> ProcessResult {
@@ -135,8 +313,11 @@ pub fn process_fees(rpc_client: &RpcClient) -> ProcessResult {
     ))
 }
 
-pub fn process_get_epoch_info(rpc_client: &RpcClient) -> ProcessResult {
-    let epoch_info = rpc_client.get_epoch_info()?;
+pub fn process_get_epoch_info(
+    rpc_client: &RpcClient,
+    commitment_config: &CommitmentConfig,
+) -> ProcessResult {
+    let epoch_info = rpc_client.get_epoch_info_with_commitment(commitment_config.clone())?;
     println!();
     println_name_value("Current epoch:", &epoch_info.epoch.to_string());
     println_name_value("Current slot:", &epoch_info.absolute_slot.to_string());
@@ -164,27 +345,36 @@ pub fn process_get_epoch_info(rpc_client: &RpcClient) -> ProcessResult {
     Ok("".to_string())
 }
 
-pub fn process_get_genesis_blockhash(rpc_client: &RpcClient) -> ProcessResult {
-    let genesis_blockhash = rpc_client.get_genesis_blockhash()?;
-    Ok(genesis_blockhash.to_string())
+pub fn process_get_genesis_hash(rpc_client: &RpcClient) -> ProcessResult {
+    let genesis_hash = rpc_client.get_genesis_hash()?;
+    Ok(genesis_hash.to_string())
 }
 
-pub fn process_get_slot(rpc_client: &RpcClient) -> ProcessResult {
-    let slot = rpc_client.get_slot()?;
+pub fn process_get_slot(
+    rpc_client: &RpcClient,
+    commitment_config: &CommitmentConfig,
+) -> ProcessResult {
+    let slot = rpc_client.get_slot_with_commitment(commitment_config.clone())?;
     Ok(slot.to_string())
 }
 
-pub fn process_get_transaction_count(rpc_client: &RpcClient) -> ProcessResult {
-    let transaction_count = rpc_client.get_transaction_count()?;
+pub fn process_get_transaction_count(
+    rpc_client: &RpcClient,
+    commitment_config: &CommitmentConfig,
+) -> ProcessResult {
+    let transaction_count =
+        rpc_client.get_transaction_count_with_commitment(commitment_config.clone())?;
     Ok(transaction_count.to_string())
 }
 
 pub fn process_ping(
     rpc_client: &RpcClient,
     config: &CliConfig,
+    lamports: u64,
     interval: &Duration,
     count: &Option<u64>,
     timeout: &Duration,
+    commitment_config: &CommitmentConfig,
 ) -> ProcessResult {
     let to = Keypair::new().pubkey();
 
@@ -207,14 +397,18 @@ pub fn process_ping(
         let (recent_blockhash, fee_calculator) = rpc_client.get_new_blockhash(&last_blockhash)?;
         last_blockhash = recent_blockhash;
 
-        let transaction = system_transaction::transfer(&config.keypair, &to, 1, recent_blockhash);
+        let transaction =
+            system_transaction::transfer(&config.keypair, &to, lamports, recent_blockhash);
         check_account_for_fee(rpc_client, config, &fee_calculator, &transaction.message)?;
 
         match rpc_client.send_transaction(&transaction) {
             Ok(signature) => {
                 let transaction_sent = Instant::now();
                 loop {
-                    let signature_status = rpc_client.get_signature_status(&signature)?;
+                    let signature_status = rpc_client.get_signature_status_with_commitment(
+                        &signature,
+                        commitment_config.clone(),
+                    )?;
                     let elapsed_time = Instant::now().duration_since(transaction_sent);
                     if let Some(transaction_status) = signature_status {
                         match transaction_status {
@@ -222,8 +416,8 @@ pub fn process_ping(
                                 let elapsed_time_millis = elapsed_time.as_millis() as u64;
                                 confirmation_time.push_back(elapsed_time_millis);
                                 println!(
-                                    "{}1 lamport transferred: seq={:<3} time={:>4}ms signature={}",
-                                    CHECK_MARK, seq, elapsed_time_millis, signature
+                                    "{}{} lamport(s) transferred: seq={:<3} time={:>4}ms signature={}",
+                                    CHECK_MARK, lamports, seq, elapsed_time_millis, signature
                                 );
                                 confirmed_count += 1;
                             }
@@ -295,19 +489,86 @@ pub fn process_ping(
     Ok("".to_string())
 }
 
+pub fn process_show_gossip(rpc_client: &RpcClient) -> ProcessResult {
+    let cluster_nodes = rpc_client.get_cluster_nodes()?;
+
+    fn format_port(addr: Option<SocketAddr>) -> String {
+        addr.map(|addr| addr.port().to_string())
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    let s: Vec<_> = cluster_nodes
+        .iter()
+        .map(|node| {
+            format!(
+                "{:15} | {:44} | {:6} | {:5} | {:5}",
+                node.gossip
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                node.pubkey,
+                format_port(node.gossip),
+                format_port(node.tpu),
+                format_port(node.rpc),
+            )
+        })
+        .collect();
+
+    Ok(format!(
+        "IP Address      | Node identifier                              \
+         | Gossip | TPU   | RPC\n\
+         ----------------+----------------------------------------------+\
+         --------+-------+-------\n\
+         {}\n\
+         Nodes: {}",
+        s.join("\n"),
+        s.len(),
+    ))
+}
+
 pub fn process_show_validators(rpc_client: &RpcClient, use_lamports_unit: bool) -> ProcessResult {
     let vote_accounts = rpc_client.get_vote_accounts()?;
-    let total_activate_stake = vote_accounts
+    let total_active_stake = vote_accounts
         .current
         .iter()
         .chain(vote_accounts.delinquent.iter())
         .fold(0, |acc, vote_account| acc + vote_account.activated_stake)
         as f64;
 
+    let total_deliquent_stake = vote_accounts
+        .delinquent
+        .iter()
+        .fold(0, |acc, vote_account| acc + vote_account.activated_stake)
+        as f64;
+    let total_current_stake = total_active_stake - total_deliquent_stake;
+
+    println_name_value(
+        "Active Stake:",
+        &build_balance_message(total_active_stake as u64, use_lamports_unit, true),
+    );
+    if total_deliquent_stake > 0. {
+        println_name_value(
+            "Current Stake:",
+            &format!(
+                "{} ({:0.2}%)",
+                &build_balance_message(total_current_stake as u64, use_lamports_unit, true),
+                100. * total_current_stake / total_active_stake
+            ),
+        );
+        println_name_value(
+            "Delinquent Stake:",
+            &format!(
+                "{} ({:0.2}%)",
+                &build_balance_message(total_deliquent_stake as u64, use_lamports_unit, true),
+                100. * total_deliquent_stake / total_active_stake
+            ),
+        );
+    }
+    println!();
+
     println!(
         "{}",
         style(format!(
-            "{:<44}  {:<44}  {:<11}  {:>10}  {:>11}  {}",
+            "  {:<44}  {:<44}  {:<11}  {:>10}  {:>11}  {}",
             "Identity Pubkey",
             "Vote Account Pubkey",
             "Commission",
@@ -318,11 +579,12 @@ pub fn process_show_validators(rpc_client: &RpcClient, use_lamports_unit: bool) 
         .bold()
     );
 
-    for vote_account in vote_accounts
-        .current
-        .iter()
-        .chain(vote_accounts.delinquent.iter())
-    {
+    fn print_vote_account(
+        vote_account: &RpcVoteAccountInfo,
+        total_active_stake: f64,
+        use_lamports_unit: bool,
+        delinquent: bool,
+    ) {
         fn non_zero_or_dash(v: u64) -> String {
             if v == 0 {
                 "-".into()
@@ -330,9 +592,13 @@ pub fn process_show_validators(rpc_client: &RpcClient, use_lamports_unit: bool) 
                 format!("{}", v)
             }
         }
-
         println!(
-            "{:<44}  {:<44}  {:>3} ({:>4.1}%)  {:>10}  {:>11}  {:>11}",
+            "{} {:<44}  {:<44}  {:>3} ({:>4.1}%)  {:>10}  {:>11}  {:>11}",
+            if delinquent {
+                WARNING.to_string()
+            } else {
+                " ".to_string()
+            },
             vote_account.node_pubkey,
             vote_account.vote_pubkey,
             vote_account.commission,
@@ -342,13 +608,20 @@ pub fn process_show_validators(rpc_client: &RpcClient, use_lamports_unit: bool) 
             if vote_account.activated_stake > 0 {
                 format!(
                     "{} ({:.2}%)",
-                    build_balance_message(vote_account.activated_stake, use_lamports_unit),
-                    100. * vote_account.activated_stake as f64 / total_activate_stake
+                    build_balance_message(vote_account.activated_stake, use_lamports_unit, true),
+                    100. * vote_account.activated_stake as f64 / total_active_stake
                 )
             } else {
                 "-".into()
             },
         );
+    }
+
+    for vote_account in vote_accounts.current.iter() {
+        print_vote_account(vote_account, total_active_stake, use_lamports_unit, false);
+    }
+    for vote_account in vote_accounts.delinquent.iter() {
+        print_vote_account(vote_account, total_active_stake, use_lamports_unit, true);
     }
 
     Ok("".to_string())
@@ -358,70 +631,104 @@ pub fn process_show_validators(rpc_client: &RpcClient, use_lamports_unit: bool) 
 mod tests {
     use super::*;
     use crate::cli::{app, parse_command};
-    use solana_sdk::pubkey::Pubkey;
 
     #[test]
     fn test_parse_command() {
         let test_commands = app("test", "desc", "version");
-        let pubkey = Pubkey::new_rand();
 
         let test_cluster_version = test_commands
             .clone()
             .get_matches_from(vec!["test", "cluster-version"]);
         assert_eq!(
-            parse_command(&pubkey, &test_cluster_version).unwrap(),
-            CliCommand::ClusterVersion
+            parse_command(&test_cluster_version).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::ClusterVersion,
+                require_keypair: false
+            }
         );
 
         let test_fees = test_commands.clone().get_matches_from(vec!["test", "fees"]);
         assert_eq!(
-            parse_command(&pubkey, &test_fees).unwrap(),
-            CliCommand::Fees
+            parse_command(&test_fees).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::Fees,
+                require_keypair: false
+            }
         );
 
         let test_get_epoch_info = test_commands
             .clone()
             .get_matches_from(vec!["test", "get-epoch-info"]);
         assert_eq!(
-            parse_command(&pubkey, &test_get_epoch_info).unwrap(),
-            CliCommand::GetEpochInfo
+            parse_command(&test_get_epoch_info).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::GetEpochInfo {
+                    commitment_config: CommitmentConfig::recent(),
+                },
+                require_keypair: false
+            }
         );
 
-        let test_get_genesis_blockhash = test_commands
+        let test_get_genesis_hash = test_commands
             .clone()
-            .get_matches_from(vec!["test", "get-genesis-blockhash"]);
+            .get_matches_from(vec!["test", "get-genesis-hash"]);
         assert_eq!(
-            parse_command(&pubkey, &test_get_genesis_blockhash).unwrap(),
-            CliCommand::GetGenesisBlockhash
+            parse_command(&test_get_genesis_hash).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::GetGenesisHash,
+                require_keypair: false
+            }
         );
 
         let test_get_slot = test_commands
             .clone()
             .get_matches_from(vec!["test", "get-slot"]);
         assert_eq!(
-            parse_command(&pubkey, &test_get_slot).unwrap(),
-            CliCommand::GetSlot
+            parse_command(&test_get_slot).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::GetSlot {
+                    commitment_config: CommitmentConfig::recent(),
+                },
+                require_keypair: false
+            }
         );
 
         let test_transaction_count = test_commands
             .clone()
             .get_matches_from(vec!["test", "get-transaction-count"]);
         assert_eq!(
-            parse_command(&pubkey, &test_transaction_count).unwrap(),
-            CliCommand::GetTransactionCount
+            parse_command(&test_transaction_count).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::GetTransactionCount {
+                    commitment_config: CommitmentConfig::recent(),
+                },
+                require_keypair: false
+            }
         );
 
-        let test_ping = test_commands
-            .clone()
-            .get_matches_from(vec!["test", "ping", "-i", "1", "-c", "2", "-t", "3"]);
+        let test_ping = test_commands.clone().get_matches_from(vec![
+            "test",
+            "ping",
+            "-i",
+            "1",
+            "-c",
+            "2",
+            "-t",
+            "3",
+            "--confirmed",
+        ]);
         assert_eq!(
-            parse_command(&pubkey, &test_ping).unwrap(),
-            CliCommand::Ping {
-                interval: Duration::from_secs(1),
-                count: Some(2),
-                timeout: Duration::from_secs(3),
+            parse_command(&test_ping).unwrap(),
+            CliCommandInfo {
+                command: CliCommand::Ping {
+                    lamports: 1,
+                    interval: Duration::from_secs(1),
+                    count: Some(2),
+                    timeout: Duration::from_secs(3),
+                    commitment_config: CommitmentConfig::default(),
+                },
+                require_keypair: true
             }
         );
     }
-    // TODO: Add process tests
 }

@@ -1,7 +1,6 @@
 //! The `poh_service` module implements a service that records the passing of
 //! "ticks", a measure of time in the PoH stream
 use crate::poh_recorder::PohRecorder;
-use crate::service::Service;
 use core_affinity;
 use solana_sdk::poh_config::PohConfig;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,12 +95,8 @@ impl PohService {
             }
         }
     }
-}
 
-impl Service for PohService {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         self.tick_producer.join()
     }
 }
@@ -109,12 +104,12 @@ impl Service for PohService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocktree::{get_tmp_ledger_path, Blocktree};
-    use crate::genesis_utils::{create_genesis_block, GenesisBlockInfo};
-    use crate::leader_schedule_cache::LeaderScheduleCache;
+    use crate::genesis_utils::{create_genesis_config, GenesisConfigInfo};
     use crate::poh_recorder::WorkingBank;
     use crate::result::Result;
-    use crate::test_tx::test_tx;
+    use solana_ledger::leader_schedule_cache::LeaderScheduleCache;
+    use solana_ledger::{blocktree::Blocktree, get_tmp_ledger_path};
+    use solana_perf::test_tx::test_tx;
     use solana_runtime::bank::Bank;
     use solana_sdk::hash::hash;
     use solana_sdk::pubkey::Pubkey;
@@ -122,8 +117,8 @@ mod tests {
 
     #[test]
     fn test_poh_service() {
-        let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(2);
-        let bank = Arc::new(Bank::new(&genesis_block));
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(2);
+        let bank = Arc::new(Bank::new(&genesis_config));
         let prev_hash = bank.last_blockhash();
         let ledger_path = get_tmp_ledger_path!();
         {

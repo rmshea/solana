@@ -1,13 +1,11 @@
 //! The `result` module exposes a Result type that propagates one of many different Error types.
 
-use crate::blocktree;
 use crate::cluster_info;
-use crate::packet;
 use crate::poh_recorder;
-use bincode;
-use serde_json;
+use solana_ledger::block_error;
+use solana_ledger::blocktree;
+use solana_ledger::snapshot_utils;
 use solana_sdk::transaction;
-use std;
 use std::any::Any;
 
 #[derive(Debug)]
@@ -25,13 +23,13 @@ pub enum Error {
     Serialize(std::boxed::Box<bincode::ErrorKind>),
     TransactionError(transaction::TransactionError),
     ClusterInfoError(cluster_info::ClusterInfoError),
-    BlobError(packet::BlobError),
     ErasureError(reed_solomon_erasure::Error),
     SendError,
     PohRecorderError(poh_recorder::PohRecorderError),
+    BlockError(block_error::BlockError),
     BlocktreeError(blocktree::BlocktreeError),
     FsExtra(fs_extra::error::Error),
-    ToBlobError,
+    SnapshotError(snapshot_utils::SnapshotError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -132,6 +130,11 @@ impl std::convert::From<poh_recorder::PohRecorderError> for Error {
 impl std::convert::From<blocktree::BlocktreeError> for Error {
     fn from(e: blocktree::BlocktreeError) -> Error {
         Error::BlocktreeError(e)
+    }
+}
+impl std::convert::From<snapshot_utils::SnapshotError> for Error {
+    fn from(e: snapshot_utils::SnapshotError) -> Error {
+        Error::SnapshotError(e)
     }
 }
 

@@ -1,7 +1,7 @@
 //! Crds Gossip
 //! This module ties together Crds and the push and pull gossip overlays.  The interface is
 //! designed to run with a simulator or over a UDP network connection with messages up to a
-//! packet::BLOB_DATA_SIZE size.
+//! packet::PACKET_DATA_SIZE size.
 
 use crate::crds::{Crds, VersionedCrdsValue};
 use crate::crds_gossip_error::CrdsGossipError;
@@ -9,7 +9,6 @@ use crate::crds_gossip_pull::{CrdsFilter, CrdsGossipPull};
 use crate::crds_gossip_push::{CrdsGossipPush, CRDS_GOSSIP_NUM_ACTIVE};
 use crate::crds_value::{CrdsValue, CrdsValueLabel};
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signable;
 use std::collections::{HashMap, HashSet};
 
 ///The min size for bloom filters
@@ -163,7 +162,21 @@ impl CrdsGossip {
         self.pull
             .process_pull_response(&mut self.crds, from, response, now)
     }
-    pub fn purge(&mut self, now: u64) {
+
+    pub fn make_timeouts_test(&self) -> HashMap<Pubkey, u64> {
+        self.make_timeouts(&HashMap::new(), self.pull.crds_timeout)
+    }
+
+    pub fn make_timeouts(
+        &self,
+        stakes: &HashMap<Pubkey, u64>,
+        epoch_ms: u64,
+    ) -> HashMap<Pubkey, u64> {
+        self.pull.make_timeouts(&self.id, stakes, epoch_ms)
+    }
+
+    pub fn purge(&mut self, now: u64, timeouts: &HashMap<Pubkey, u64>) -> usize {
+        let mut rv = 0;
         if now > self.push.msg_timeout {
             let min = now - self.push.msg_timeout;
             self.push.purge_old_pending_push_messages(&self.crds, min);
@@ -173,13 +186,17 @@ impl CrdsGossip {
             self.push.purge_old_received_cache(min);
         }
         if now > self.pull.crds_timeout {
-            let min = now - self.pull.crds_timeout;
-            self.pull.purge_active(&mut self.crds, &self.id, min);
+            //sanity check
+            let min = self.pull.crds_timeout;
+            assert_eq!(timeouts[&self.id], std::u64::MAX);
+            assert_eq!(timeouts[&Pubkey::default()], min);
+            rv = self.pull.purge_active(&mut self.crds, now, &timeouts);
         }
         if now > 5 * self.pull.crds_timeout {
             let min = now - 5 * self.pull.crds_timeout;
             self.pull.purge_purged(min);
         }
+        rv
     }
 }
 
@@ -204,6 +221,7 @@ pub fn get_weight(max_weight: f32, time_since_last_selected: u32, stake: f32) ->
 mod test {
     use super::*;
     use crate::contact_info::ContactInfo;
+    use crate::crds_value::CrdsData;
     use solana_sdk::hash::hash;
     use solana_sdk::timing::timestamp;
 
@@ -216,7 +234,10 @@ mod test {
         let prune_pubkey = Pubkey::new(&[2; 32]);
         crds_gossip
             .crds
-            .insert(CrdsValue::ContactInfo(ci.clone()), 0)
+            .insert(
+                CrdsValue::new_unsigned(CrdsData::ContactInfo(ci.clone())),
+                0,
+            )
             .unwrap();
         crds_gossip.refresh_push_active_set(&HashMap::new());
         let now = timestamp();

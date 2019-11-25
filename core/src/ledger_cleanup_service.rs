@@ -1,8 +1,7 @@
 //! The `ledger_cleanup_service` drops older ledger data to limit disk space usage
 
-use crate::blocktree::Blocktree;
 use crate::result::{Error, Result};
-use crate::service::Service;
+use solana_ledger::blocktree::Blocktree;
 use solana_sdk::clock::DEFAULT_SLOTS_PER_EPOCH;
 use solana_sdk::pubkey::Pubkey;
 use std::string::ToString;
@@ -63,20 +62,16 @@ impl LedgerCleanupService {
         }
         Ok(())
     }
-}
 
-impl Service for LedgerCleanupService {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         self.t_cleanup.join()
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocktree::get_tmp_ledger_path;
-    use crate::blocktree::tests::make_many_slot_entries;
+    use solana_ledger::blocktree::make_many_slot_entries;
+    use solana_ledger::get_tmp_ledger_path;
     use std::sync::mpsc::channel;
 
     #[test]
@@ -84,7 +79,7 @@ mod tests {
         let blocktree_path = get_tmp_ledger_path!();
         let blocktree = Blocktree::open(&blocktree_path).unwrap();
         let (shreds, _) = make_many_slot_entries(0, 50, 5);
-        blocktree.insert_shreds(shreds, None).unwrap();
+        blocktree.insert_shreds(shreds, None, false).unwrap();
         let blocktree = Arc::new(blocktree);
         let (sender, receiver) = channel();
 

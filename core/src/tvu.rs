@@ -1,43 +1,47 @@
-//! The `tvu` module implements the Transaction Validation Unit, a
-//! multi-stage transaction validation pipeline in software.
-//!
-//! 1. BlobFetchStage
-//! - Incoming blobs are picked up from the TVU sockets and repair socket.
-//! 2. RetransmitStage
-//! - Blobs are windowed until a contiguous chunk is available.  This stage also repairs and
-//! retransmits blobs that are in the queue.
-//! 3. ReplayStage
-//! - Transactions in blobs are processed and applied to the bank.
-//! - TODO We need to verify the signatures in the blobs.
-//! 4. StorageStage
-//! - Generating the keys used to encrypt the ledger and sample it for storage mining.
+//! The `tvu` module implements the Transaction Validation Unit, a multi-stage transaction
+//! validation pipeline in software.
 
-use crate::bank_forks::BankForks;
-use crate::blockstream_service::BlockstreamService;
-use crate::blocktree::{Blocktree, CompletedSlotsReceiver};
-use crate::cluster_info::ClusterInfo;
-use crate::confidence::ForkConfidenceCache;
-use crate::leader_schedule_cache::LeaderScheduleCache;
-use crate::ledger_cleanup_service::LedgerCleanupService;
-use crate::poh_recorder::PohRecorder;
-use crate::replay_stage::ReplayStage;
-use crate::retransmit_stage::RetransmitStage;
-use crate::rpc_subscriptions::RpcSubscriptions;
-use crate::service::Service;
-use crate::shred_fetch_stage::ShredFetchStage;
-use crate::snapshot_package::SnapshotPackagerService;
-use crate::storage_stage::{StorageStage, StorageState};
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::{Keypair, KeypairUtil};
-use std::net::UdpSocket;
-use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
+use crate::{
+    blockstream_service::BlockstreamService,
+    cluster_info::ClusterInfo,
+    commitment::BlockCommitmentCache,
+    ledger_cleanup_service::LedgerCleanupService,
+    partition_cfg::PartitionCfg,
+    poh_recorder::PohRecorder,
+    replay_stage::ReplayStage,
+    retransmit_stage::RetransmitStage,
+    rpc_subscriptions::RpcSubscriptions,
+    shred_fetch_stage::ShredFetchStage,
+    sigverify_shreds::ShredSigVerifier,
+    sigverify_stage::{DisabledSigVerifier, SigVerifyStage},
+    snapshot_packager_service::SnapshotPackagerService,
+    storage_stage::{StorageStage, StorageState},
+};
+use crossbeam_channel::unbounded;
+use solana_ledger::leader_schedule_cache::LeaderScheduleCache;
+use solana_ledger::{
+    bank_forks::BankForks,
+    blocktree::{Blocktree, CompletedSlotsReceiver},
+    blocktree_processor::TransactionStatusSender,
+};
+use solana_sdk::{
+    pubkey::Pubkey,
+    signature::{Keypair, KeypairUtil},
+};
+use std::{
+    net::UdpSocket,
+    path::PathBuf,
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{channel, Receiver},
+        Arc, Mutex, RwLock,
+    },
+    thread,
+};
 
 pub struct Tvu {
     fetch_stage: ShredFetchStage,
+    sigverify_stage: SigVerifyStage,
     retransmit_stage: RetransmitStage,
     replay_stage: ReplayStage,
     blockstream_service: Option<BlockstreamService>,
@@ -78,7 +82,11 @@ impl Tvu {
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
         exit: &Arc<AtomicBool>,
         completed_slots_receiver: CompletedSlotsReceiver,
-        fork_confidence_cache: Arc<RwLock<ForkConfidenceCache>>,
+        block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
+        sigverify_disabled: bool,
+        cfg: Option<PartitionCfg>,
+        shred_version: u16,
+        transaction_status_sender: Option<TransactionStatusSender>,
     ) -> Self
     where
         T: 'static + KeypairUtil + Sync + Send,
@@ -110,9 +118,21 @@ impl Tvu {
             &exit,
         );
 
-        //TODO
-        //the packets coming out of blob_receiver need to be sent to the GPU and verified
-        //then sent to the window, which does the erasure coding reconstruction
+        let (verified_sender, verified_receiver) = unbounded();
+        let sigverify_stage = if !sigverify_disabled {
+            SigVerifyStage::new(
+                fetch_receiver,
+                verified_sender.clone(),
+                ShredSigVerifier::new(bank_forks.clone(), leader_schedule_cache.clone()),
+            )
+        } else {
+            SigVerifyStage::new(
+                fetch_receiver,
+                verified_sender.clone(),
+                DisabledSigVerifier::default(),
+            )
+        };
+
         let retransmit_stage = RetransmitStage::new(
             bank_forks.clone(),
             leader_schedule_cache,
@@ -120,10 +140,12 @@ impl Tvu {
             &cluster_info,
             Arc::new(retransmit_sockets),
             repair_socket,
-            fetch_receiver,
+            verified_receiver,
             &exit,
             completed_slots_receiver,
             *bank_forks.read().unwrap().working_bank().epoch_schedule(),
+            cfg,
+            shred_version,
         );
 
         let (blockstream_slot_sender, blockstream_slot_receiver) = channel();
@@ -154,7 +176,8 @@ impl Tvu {
             leader_schedule_cache,
             vec![blockstream_slot_sender, ledger_cleanup_slot_sender],
             snapshot_package_sender,
-            fork_confidence_cache,
+            block_commitment_cache,
+            transaction_status_sender,
         );
 
         let blockstream_service = if let Some(blockstream_unix_socket) = blockstream_unix_socket {
@@ -191,6 +214,7 @@ impl Tvu {
 
         Tvu {
             fetch_stage,
+            sigverify_stage,
             retransmit_stage,
             replay_stage,
             blockstream_service,
@@ -199,14 +223,11 @@ impl Tvu {
             snapshot_packager_service,
         }
     }
-}
 
-impl Service for Tvu {
-    type JoinReturnType = ();
-
-    fn join(self) -> thread::Result<()> {
+    pub fn join(self) -> thread::Result<()> {
         self.retransmit_stage.join()?;
         self.fetch_stage.join()?;
+        self.sigverify_stage.join()?;
         self.storage_stage.join()?;
         if self.blockstream_service.is_some() {
             self.blockstream_service.unwrap().join()?;
@@ -226,9 +247,9 @@ impl Service for Tvu {
 pub mod tests {
     use super::*;
     use crate::banking_stage::create_test_recorder;
-    use crate::blocktree::create_new_tmp_ledger;
     use crate::cluster_info::{ClusterInfo, Node};
-    use crate::genesis_utils::{create_genesis_block, GenesisBlockInfo};
+    use crate::genesis_utils::{create_genesis_config, GenesisConfigInfo};
+    use solana_ledger::create_new_tmp_ledger;
     use solana_runtime::bank::Bank;
     use std::sync::atomic::Ordering;
 
@@ -240,16 +261,16 @@ pub mod tests {
         let target1 = Node::new_localhost_with_pubkey(&target1_keypair.pubkey());
 
         let starting_balance = 10_000;
-        let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(starting_balance);
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(starting_balance);
 
-        let bank_forks = BankForks::new(0, Bank::new(&genesis_block));
+        let bank_forks = BankForks::new(0, Bank::new(&genesis_config));
 
         //start cluster_info1
         let mut cluster_info1 = ClusterInfo::new_with_invalid_keypair(target1.info.clone());
         cluster_info1.insert_info(leader.info.clone());
         let cref1 = Arc::new(RwLock::new(cluster_info1));
 
-        let (blocktree_path, _) = create_new_tmp_ledger!(&genesis_block);
+        let (blocktree_path, _) = create_new_tmp_ledger!(&genesis_config);
         let (blocktree, l_receiver, completed_slots_receiver) =
             Blocktree::open_with_signal(&blocktree_path)
                 .expect("Expected to successfully open ledger");
@@ -260,7 +281,7 @@ pub mod tests {
         let voting_keypair = Keypair::new();
         let storage_keypair = Arc::new(Keypair::new());
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank));
-        let fork_confidence_cache = Arc::new(RwLock::new(ForkConfidenceCache::default()));
+        let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
         let tvu = Tvu::new(
             &voting_keypair.pubkey(),
             Some(&Arc::new(voting_keypair)),
@@ -285,7 +306,11 @@ pub mod tests {
             &leader_schedule_cache,
             &exit,
             completed_slots_receiver,
-            fork_confidence_cache,
+            block_commitment_cache,
+            false,
+            None,
+            0,
+            None,
         );
         exit.store(true, Ordering::Relaxed);
         tvu.join().unwrap();

@@ -1,12 +1,14 @@
 use super::*;
-use crate::shred::{Shredder, RECOMMENDED_FEC_RATE};
+use solana_ledger::shred::{Shredder, RECOMMENDED_FEC_RATE};
 use solana_sdk::hash::Hash;
 
-pub(super) struct FailEntryVerificationBroadcastRun {}
+pub(super) struct FailEntryVerificationBroadcastRun {
+    shred_version: u16,
+}
 
 impl FailEntryVerificationBroadcastRun {
-    pub(super) fn new() -> Self {
-        Self {}
+    pub(super) fn new(shred_version: u16) -> Self {
+        Self { shred_version }
     }
 }
 
@@ -23,7 +25,7 @@ impl BroadcastRun for FailEntryVerificationBroadcastRun {
         let bank = receive_results.bank.clone();
         let last_tick_height = receive_results.last_tick_height;
 
-        // 2) Convert entries to blobs + generate coding blobs. Set a garbage PoH on the last entry
+        // 2) Convert entries to shreds + generate coding shreds. Set a garbage PoH on the last entry
         // in the slot to make verification fail on validators
         if last_tick_height == bank.max_tick_height() {
             let mut last_entry = receive_results.entries.last_mut().unwrap();
@@ -42,6 +44,8 @@ impl BroadcastRun for FailEntryVerificationBroadcastRun {
             bank.parent().unwrap().slot(),
             RECOMMENDED_FEC_RATE,
             keypair.clone(),
+            (bank.tick_height() % bank.ticks_per_slot()) as u8,
+            self.shred_version,
         )
         .expect("Expected to create a new shredder");
 
@@ -58,7 +62,7 @@ impl BroadcastRun for FailEntryVerificationBroadcastRun {
             .collect::<Vec<_>>();
         let all_seeds: Vec<[u8; 32]> = all_shreds.iter().map(|s| s.seed()).collect();
         blocktree
-            .insert_shreds(all_shreds, None)
+            .insert_shreds(all_shreds, None, true)
             .expect("Failed to insert shreds in blocktree");
 
         // 3) Start broadcast step

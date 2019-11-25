@@ -1,13 +1,12 @@
 //! A stage to broadcast data from a leader node to validators
-use self::broadcast_fake_blobs_run::BroadcastFakeBlobsRun;
+use self::broadcast_fake_shreds_run::BroadcastFakeShredsRun;
 use self::fail_entry_verification_broadcast_run::FailEntryVerificationBroadcastRun;
 use self::standard_broadcast_run::StandardBroadcastRun;
-use crate::blocktree::Blocktree;
 use crate::cluster_info::{ClusterInfo, ClusterInfoError};
 use crate::poh_recorder::WorkingBankEntry;
 use crate::result::{Error, Result};
-use crate::service::Service;
-use crate::staking_utils;
+use solana_ledger::blocktree::Blocktree;
+use solana_ledger::staking_utils;
 use solana_metrics::{inc_new_counter_error, inc_new_counter_info};
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +15,7 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, Builder, JoinHandle};
 use std::time::Instant;
 
-mod broadcast_fake_blobs_run;
+mod broadcast_fake_shreds_run;
 pub(crate) mod broadcast_utils;
 mod fail_entry_verification_broadcast_run;
 mod standard_broadcast_run;
@@ -32,7 +31,7 @@ pub enum BroadcastStageReturnType {
 pub enum BroadcastStageType {
     Standard,
     FailEntryVerification,
-    BroadcastFakeBlobs,
+    BroadcastFakeShreds,
 }
 
 impl BroadcastStageType {
@@ -43,6 +42,7 @@ impl BroadcastStageType {
         receiver: Receiver<WorkingBankEntry>,
         exit_sender: &Arc<AtomicBool>,
         blocktree: &Arc<Blocktree>,
+        shred_version: u16,
     ) -> BroadcastStage {
         match self {
             BroadcastStageType::Standard => {
@@ -53,7 +53,7 @@ impl BroadcastStageType {
                     receiver,
                     exit_sender,
                     blocktree,
-                    StandardBroadcastRun::new(keypair),
+                    StandardBroadcastRun::new(keypair, shred_version),
                 )
             }
 
@@ -63,16 +63,16 @@ impl BroadcastStageType {
                 receiver,
                 exit_sender,
                 blocktree,
-                FailEntryVerificationBroadcastRun::new(),
+                FailEntryVerificationBroadcastRun::new(shred_version),
             ),
 
-            BroadcastStageType::BroadcastFakeBlobs => BroadcastStage::new(
+            BroadcastStageType::BroadcastFakeShreds => BroadcastStage::new(
                 sock,
                 cluster_info,
                 receiver,
                 exit_sender,
                 blocktree,
-                BroadcastFakeBlobsRun::new(0),
+                BroadcastFakeShredsRun::new(0, shred_version),
             ),
         }
     }
@@ -142,8 +142,8 @@ impl BroadcastStage {
     /// * `sock` - Socket to send from.
     /// * `exit` - Boolean to signal system exit.
     /// * `cluster_info` - ClusterInfo structure
-    /// * `window` - Cache of blobs that we have broadcast
-    /// * `receiver` - Receive channel for blobs to be retransmitted to all the layer 1 nodes.
+    /// * `window` - Cache of Shreds that we have broadcast
+    /// * `receiver` - Receive channel for Shreds to be retransmitted to all the layer 1 nodes.
     /// * `exit_sender` - Set to true when this service exits, allows rest of Tpu to exit cleanly.
     /// Otherwise, when a Tpu closes, it only closes the stages that come after it. The stages
     /// that come before could be blocked on a receive, and never notice that they need to
@@ -178,12 +178,8 @@ impl BroadcastStage {
 
         Self { thread_hdl }
     }
-}
 
-impl Service for BroadcastStage {
-    type JoinReturnType = BroadcastStageReturnType;
-
-    fn join(self) -> thread::Result<BroadcastStageReturnType> {
+    pub fn join(self) -> thread::Result<BroadcastStageReturnType> {
         self.thread_hdl.join()
     }
 }
@@ -191,11 +187,10 @@ impl Service for BroadcastStage {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::blocktree::{get_tmp_ledger_path, Blocktree};
     use crate::cluster_info::{ClusterInfo, Node};
-    use crate::entry::create_ticks;
-    use crate::genesis_utils::{create_genesis_block, GenesisBlockInfo};
-    use crate::service::Service;
+    use crate::genesis_utils::{create_genesis_config, GenesisConfigInfo};
+    use solana_ledger::entry::create_ticks;
+    use solana_ledger::{blocktree::Blocktree, get_tmp_ledger_path};
     use solana_runtime::bank::Bank;
     use solana_sdk::hash::Hash;
     use solana_sdk::pubkey::Pubkey;
@@ -235,8 +230,8 @@ mod test {
 
         let exit_sender = Arc::new(AtomicBool::new(false));
 
-        let GenesisBlockInfo { genesis_block, .. } = create_genesis_block(10_000);
-        let bank = Arc::new(Bank::new(&genesis_block));
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank = Arc::new(Bank::new(&genesis_config));
 
         let leader_keypair = cluster_info.read().unwrap().keypair.clone();
         // Start up the broadcast stage
@@ -246,7 +241,7 @@ mod test {
             entry_receiver,
             &exit_sender,
             &blocktree,
-            StandardBroadcastRun::new(leader_keypair),
+            StandardBroadcastRun::new(leader_keypair, 0),
         );
 
         MockBroadcastStage {
@@ -259,7 +254,7 @@ mod test {
     #[test]
     fn test_broadcast_ledger() {
         solana_logger::setup();
-        let ledger_path = get_tmp_ledger_path("test_broadcast_ledger");
+        let ledger_path = get_tmp_ledger_path!();
 
         {
             // Create the leader scheduler
@@ -281,7 +276,7 @@ mod test {
                 max_tick_height = bank.max_tick_height();
                 ticks_per_slot = bank.ticks_per_slot();
                 slot = bank.slot();
-                let ticks = create_ticks(max_tick_height - start_tick_height, Hash::default());
+                let ticks = create_ticks(max_tick_height - start_tick_height, 0, Hash::default());
                 for (i, tick) in ticks.into_iter().enumerate() {
                     entry_sender
                         .send((bank.clone(), (tick, i as u64 + 1)))
@@ -298,8 +293,8 @@ mod test {
             );
 
             let blocktree = broadcast_service.blocktree;
-            let (entries, _, _, _) = blocktree
-                .get_slot_entries_with_shred_count(slot, 0)
+            let (entries, _, _) = blocktree
+                .get_slot_entries_with_shred_info(slot, 0)
                 .expect("Expect entries to be present");
             assert_eq!(entries.len(), max_tick_height as usize);
 

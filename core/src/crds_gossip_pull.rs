@@ -263,13 +263,39 @@ impl CrdsGossipPull {
         }
         ret
     }
+    pub fn make_timeouts_def(
+        &self,
+        self_id: &Pubkey,
+        stakes: &HashMap<Pubkey, u64>,
+        epoch_ms: u64,
+        min_ts: u64,
+    ) -> HashMap<Pubkey, u64> {
+        let mut timeouts: HashMap<Pubkey, u64> = stakes.keys().map(|s| (*s, epoch_ms)).collect();
+        timeouts.insert(*self_id, std::u64::MAX);
+        timeouts.insert(Pubkey::default(), min_ts);
+        timeouts
+    }
+
+    pub fn make_timeouts(
+        &self,
+        self_id: &Pubkey,
+        stakes: &HashMap<Pubkey, u64>,
+        epoch_ms: u64,
+    ) -> HashMap<Pubkey, u64> {
+        self.make_timeouts_def(self_id, stakes, epoch_ms, self.crds_timeout)
+    }
+
     /// Purge values from the crds that are older then `active_timeout`
     /// The value_hash of an active item is put into self.purged_values queue
-    pub fn purge_active(&mut self, crds: &mut Crds, self_id: &Pubkey, min_ts: u64) {
-        let old = crds.find_old_labels(min_ts);
+    pub fn purge_active(
+        &mut self,
+        crds: &mut Crds,
+        now: u64,
+        timeouts: &HashMap<Pubkey, u64>,
+    ) -> usize {
+        let old = crds.find_old_labels(now, timeouts);
         let mut purged: VecDeque<_> = old
             .iter()
-            .filter(|label| label.pubkey() != *self_id)
             .filter_map(|label| {
                 let rv = crds
                     .lookup_versioned(label)
@@ -278,7 +304,9 @@ impl CrdsGossipPull {
                 rv
             })
             .collect();
+        let ret = purged.len();
         self.purged_values.append(&mut purged);
+        ret
     }
     /// Purge values from the `self.purged_values` queue that are older then purge_timeout
     pub fn purge_purged(&mut self, min_ts: u64) {
@@ -294,6 +322,7 @@ impl CrdsGossipPull {
 mod test {
     use super::*;
     use crate::contact_info::ContactInfo;
+    use crate::crds_value::CrdsData;
     use itertools::Itertools;
     use solana_sdk::hash::hash;
     use solana_sdk::packet::PACKET_DATA_SIZE;
@@ -303,10 +332,16 @@ mod test {
         let mut crds = Crds::default();
         let mut stakes = HashMap::new();
         let node = CrdsGossipPull::default();
-        let me = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let me = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         crds.insert(me.clone(), 0).unwrap();
         for i in 1..=30 {
-            let entry = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+            let entry = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+                &Pubkey::new_rand(),
+                0,
+            )));
             let id = entry.label().pubkey();
             crds.insert(entry.clone(), 0).unwrap();
             stakes.insert(id, i * 100);
@@ -325,7 +360,10 @@ mod test {
     #[test]
     fn test_new_pull_request() {
         let mut crds = Crds::default();
-        let entry = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let entry = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         let id = entry.label().pubkey();
         let node = CrdsGossipPull::default();
         assert_eq!(
@@ -339,7 +377,10 @@ mod test {
             Err(CrdsGossipError::NoPeers)
         );
 
-        let new = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let new = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         crds.insert(new.clone(), 0).unwrap();
         let req = node.new_pull_request(&crds, &id, 0, &HashMap::new(), PACKET_DATA_SIZE);
         let (to, _, self_info) = req.unwrap();
@@ -350,13 +391,22 @@ mod test {
     #[test]
     fn test_new_mark_creation_time() {
         let mut crds = Crds::default();
-        let entry = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let entry = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         let node_pubkey = entry.label().pubkey();
         let mut node = CrdsGossipPull::default();
         crds.insert(entry.clone(), 0).unwrap();
-        let old = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let old = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         crds.insert(old.clone(), 0).unwrap();
-        let new = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let new = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         crds.insert(new.clone(), 0).unwrap();
 
         // set request creation time to max_value
@@ -380,11 +430,17 @@ mod test {
     #[test]
     fn test_process_pull_request() {
         let mut node_crds = Crds::default();
-        let entry = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let entry = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         let node_pubkey = entry.label().pubkey();
         let node = CrdsGossipPull::default();
         node_crds.insert(entry.clone(), 0).unwrap();
-        let new = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let new = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         node_crds.insert(new.clone(), 0).unwrap();
         let req = node.new_pull_request(
             &node_crds,
@@ -419,22 +475,32 @@ mod test {
     #[test]
     fn test_process_pull_request_response() {
         let mut node_crds = Crds::default();
-        let entry = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let entry = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         let node_pubkey = entry.label().pubkey();
         let mut node = CrdsGossipPull::default();
         node_crds.insert(entry.clone(), 0).unwrap();
 
-        let new = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let new = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         node_crds.insert(new.clone(), 0).unwrap();
 
         let mut dest = CrdsGossipPull::default();
         let mut dest_crds = Crds::default();
         let new_id = Pubkey::new_rand();
-        let new = CrdsValue::ContactInfo(ContactInfo::new_localhost(&new_id, 1));
+        let new = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &new_id, 1,
+        )));
         dest_crds.insert(new.clone(), 0).unwrap();
 
         // node contains a key from the dest node, but at an older local timestamp
-        let same_key = CrdsValue::ContactInfo(ContactInfo::new_localhost(&new_id, 0));
+        let same_key = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &new_id, 0,
+        )));
         assert_eq!(same_key.label(), new.label());
         assert!(same_key.wallclock() < new.wallclock());
         node_crds.insert(same_key.clone(), 0).unwrap();
@@ -494,12 +560,18 @@ mod test {
     #[test]
     fn test_gossip_purge() {
         let mut node_crds = Crds::default();
-        let entry = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let entry = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         let node_label = entry.label();
         let node_pubkey = node_label.pubkey();
         let mut node = CrdsGossipPull::default();
         node_crds.insert(entry.clone(), 0).unwrap();
-        let old = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0));
+        let old = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::new_rand(),
+            0,
+        )));
         node_crds.insert(old.clone(), 0).unwrap();
         let value_hash = node_crds.lookup_versioned(&old.label()).unwrap().value_hash;
 
@@ -507,7 +579,8 @@ mod test {
         assert_eq!(node_crds.lookup(&node_label).unwrap().label(), node_label);
 
         // purge
-        node.purge_active(&mut node_crds, &node_pubkey, 1);
+        let timeouts = node.make_timeouts_def(&node_pubkey, &HashMap::new(), 0, 1);
+        node.purge_active(&mut node_crds, 2, &timeouts);
 
         //verify self is still valid after purge
         assert_eq!(node_crds.lookup(&node_label).unwrap().label(), node_label);

@@ -1,9 +1,14 @@
-use crate::client_error::ClientError;
-use crate::generic_rpc_client_request::GenericRpcClientRequest;
-use crate::rpc_request::RpcRequest;
+use crate::rpc_request::{Response, RpcResponseContext};
+use crate::{
+    client_error::ClientError, generic_rpc_client_request::GenericRpcClientRequest,
+    rpc_request::RpcRequest,
+};
 use serde_json::{Number, Value};
-use solana_sdk::fee_calculator::FeeCalculator;
-use solana_sdk::transaction::{self, TransactionError};
+use solana_sdk::{
+    commitment_config::CommitmentConfig,
+    fee_calculator::FeeCalculator,
+    transaction::{self, TransactionError},
+};
 
 pub const PUBKEY: &str = "7RoSF9fUmdphVCpabEoefH81WwrW7orsWonXWqTXkKV8";
 pub const SIGNATURE: &str =
@@ -25,6 +30,7 @@ impl GenericRpcClientRequest for MockRpcClientRequest {
         request: &RpcRequest,
         params: Option<serde_json::Value>,
         _retries: usize,
+        _commitment_config: Option<CommitmentConfig>,
     ) -> Result<serde_json::Value, ClientError> {
         if self.url == "fails" {
             return Ok(Value::Null);
@@ -43,12 +49,18 @@ impl GenericRpcClientRequest for MockRpcClientRequest {
             }
             RpcRequest::GetBalance => {
                 let n = if self.url == "airdrop" { 0 } else { 50 };
-                Value::Number(Number::from(n))
+                serde_json::to_value(Response {
+                    context: RpcResponseContext { slot: 1 },
+                    value: Value::Number(Number::from(n)),
+                })?
             }
-            RpcRequest::GetRecentBlockhash => Value::Array(vec![
-                Value::String(PUBKEY.to_string()),
-                serde_json::to_value(FeeCalculator::default()).unwrap(),
-            ]),
+            RpcRequest::GetRecentBlockhash => serde_json::to_value(Response {
+                context: RpcResponseContext { slot: 1 },
+                value: (
+                    Value::String(PUBKEY.to_string()),
+                    serde_json::to_value(FeeCalculator::default()).unwrap(),
+                ),
+            })?,
             RpcRequest::GetSignatureStatus => {
                 let response: Option<transaction::Result<()>> = if self.url == "account_in_use" {
                     Some(Err(TransactionError::AccountInUse))

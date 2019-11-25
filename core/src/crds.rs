@@ -30,6 +30,7 @@ use indexmap::map::IndexMap;
 use solana_sdk::hash::{hash, Hash};
 use solana_sdk::pubkey::Pubkey;
 use std::cmp;
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct Crds {
@@ -141,12 +142,25 @@ impl Crds {
         }
     }
 
-    /// find all the keys that are older or equal to min_ts
-    pub fn find_old_labels(&self, min_ts: u64) -> Vec<CrdsValueLabel> {
+    /// Find all the keys that are older or equal to the timeout.
+    /// * timeouts - Pubkey specific timeouts with Pubkey::default() as the default timeout.
+    pub fn find_old_labels(
+        &self,
+        now: u64,
+        timeouts: &HashMap<Pubkey, u64>,
+    ) -> Vec<CrdsValueLabel> {
+        let min_ts = *timeouts
+            .get(&Pubkey::default())
+            .expect("must have default timeout");
         self.table
             .iter()
             .filter_map(|(k, v)| {
-                if v.local_timestamp <= min_ts {
+                if now < v.local_timestamp
+                    || (timeouts.get(&k.pubkey()).is_some()
+                        && now - v.local_timestamp < timeouts[&k.pubkey()])
+                {
+                    None
+                } else if now - v.local_timestamp >= min_ts {
                     Some(k)
                 } else {
                     None
@@ -165,11 +179,12 @@ impl Crds {
 mod test {
     use super::*;
     use crate::contact_info::ContactInfo;
+    use crate::crds_value::CrdsData;
 
     #[test]
     fn test_insert() {
         let mut crds = Crds::default();
-        let val = CrdsValue::ContactInfo(ContactInfo::default());
+        let val = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::default()));
         assert_eq!(crds.insert(val.clone(), 0).ok(), Some(None));
         assert_eq!(crds.table.len(), 1);
         assert!(crds.table.contains_key(&val.label()));
@@ -178,7 +193,7 @@ mod test {
     #[test]
     fn test_update_old() {
         let mut crds = Crds::default();
-        let val = CrdsValue::ContactInfo(ContactInfo::default());
+        let val = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::default()));
         assert_eq!(crds.insert(val.clone(), 0), Ok(None));
         assert_eq!(crds.insert(val.clone(), 1), Err(CrdsError::InsertFailed));
         assert_eq!(crds.table[&val.label()].local_timestamp, 0);
@@ -186,9 +201,15 @@ mod test {
     #[test]
     fn test_update_new() {
         let mut crds = Crds::default();
-        let original = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::default(), 0));
+        let original = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::default(),
+            0,
+        )));
         assert_matches!(crds.insert(original.clone(), 0), Ok(_));
-        let val = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::default(), 1));
+        let val = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::default(),
+            1,
+        )));
         assert_eq!(
             crds.insert(val.clone(), 1).unwrap().unwrap().value,
             original
@@ -198,14 +219,17 @@ mod test {
     #[test]
     fn test_update_timestamp() {
         let mut crds = Crds::default();
-        let val = CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::default(), 0));
+        let val = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+            &Pubkey::default(),
+            0,
+        )));
         assert_eq!(crds.insert(val.clone(), 0), Ok(None));
 
         crds.update_label_timestamp(&val.label(), 1);
         assert_eq!(crds.table[&val.label()].local_timestamp, 1);
         assert_eq!(crds.table[&val.label()].insert_timestamp, 0);
 
-        let val2 = CrdsValue::ContactInfo(ContactInfo::default());
+        let val2 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::default()));
         assert_eq!(val2.label().pubkey(), val.label().pubkey());
         assert_matches!(crds.insert(val2.clone(), 0), Ok(Some(_)));
 
@@ -221,34 +245,78 @@ mod test {
 
         let mut ci = ContactInfo::default();
         ci.wallclock += 1;
-        let val3 = CrdsValue::ContactInfo(ci);
+        let val3 = CrdsValue::new_unsigned(CrdsData::ContactInfo(ci));
         assert_matches!(crds.insert(val3.clone(), 3), Ok(Some(_)));
         assert_eq!(crds.table[&val2.label()].local_timestamp, 3);
         assert_eq!(crds.table[&val2.label()].insert_timestamp, 3);
     }
     #[test]
-    fn test_find_old_records() {
+    fn test_find_old_records_default() {
         let mut crds = Crds::default();
-        let val = CrdsValue::ContactInfo(ContactInfo::default());
+        let val = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::default()));
         assert_eq!(crds.insert(val.clone(), 1), Ok(None));
-
-        assert!(crds.find_old_labels(0).is_empty());
-        assert_eq!(crds.find_old_labels(1), vec![val.label()]);
-        assert_eq!(crds.find_old_labels(2), vec![val.label()]);
+        let mut set = HashMap::new();
+        set.insert(Pubkey::default(), 0);
+        assert!(crds.find_old_labels(0, &set).is_empty());
+        set.insert(Pubkey::default(), 1);
+        assert_eq!(crds.find_old_labels(2, &set), vec![val.label()]);
+        set.insert(Pubkey::default(), 2);
+        assert_eq!(crds.find_old_labels(4, &set), vec![val.label()]);
     }
     #[test]
-    fn test_remove() {
+    fn test_remove_default() {
         let mut crds = Crds::default();
-        let val = CrdsValue::ContactInfo(ContactInfo::default());
+        let val = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::default()));
         assert_matches!(crds.insert(val.clone(), 1), Ok(_));
-
-        assert_eq!(crds.find_old_labels(1), vec![val.label()]);
+        let mut set = HashMap::new();
+        set.insert(Pubkey::default(), 1);
+        assert_eq!(crds.find_old_labels(2, &set), vec![val.label()]);
         crds.remove(&val.label());
-        assert!(crds.find_old_labels(1).is_empty());
+        assert!(crds.find_old_labels(2, &set).is_empty());
     }
+    #[test]
+    fn test_find_old_records_staked() {
+        let mut crds = Crds::default();
+        let val = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::default()));
+        assert_eq!(crds.insert(val.clone(), 1), Ok(None));
+        let mut set = HashMap::new();
+        //now < timestamp
+        set.insert(Pubkey::default(), 0);
+        set.insert(val.pubkey(), 0);
+        assert!(crds.find_old_labels(0, &set).is_empty());
+
+        //pubkey shouldn't expire since its timeout is MAX
+        set.insert(val.pubkey(), std::u64::MAX);
+        assert!(crds.find_old_labels(2, &set).is_empty());
+
+        //default has max timeout, but pubkey should still expire
+        set.insert(Pubkey::default(), std::u64::MAX);
+        set.insert(val.pubkey(), 1);
+        assert_eq!(crds.find_old_labels(2, &set), vec![val.label()]);
+
+        set.insert(val.pubkey(), 2);
+        assert!(crds.find_old_labels(2, &set).is_empty());
+        assert_eq!(crds.find_old_labels(3, &set), vec![val.label()]);
+    }
+
+    #[test]
+    fn test_remove_staked() {
+        let mut crds = Crds::default();
+        let val = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::default()));
+        assert_matches!(crds.insert(val.clone(), 1), Ok(_));
+        let mut set = HashMap::new();
+
+        //default has max timeout, but pubkey should still expire
+        set.insert(Pubkey::default(), std::u64::MAX);
+        set.insert(val.pubkey(), 1);
+        assert_eq!(crds.find_old_labels(2, &set), vec![val.label()]);
+        crds.remove(&val.label());
+        assert!(crds.find_old_labels(2, &set).is_empty());
+    }
+
     #[test]
     fn test_equal() {
-        let val = CrdsValue::ContactInfo(ContactInfo::default());
+        let val = CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::default()));
         let v1 = VersionedCrdsValue::new(1, val.clone());
         let v2 = VersionedCrdsValue::new(1, val);
         assert_eq!(v1, v2);
@@ -258,12 +326,15 @@ mod test {
     fn test_hash_order() {
         let v1 = VersionedCrdsValue::new(
             1,
-            CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::default(), 0)),
+            CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+                &Pubkey::default(),
+                0,
+            ))),
         );
         let v2 = VersionedCrdsValue::new(1, {
             let mut contact_info = ContactInfo::new_localhost(&Pubkey::default(), 0);
             contact_info.rpc = socketaddr!("0.0.0.0:0");
-            CrdsValue::ContactInfo(contact_info)
+            CrdsValue::new_unsigned(CrdsData::ContactInfo(contact_info))
         });
 
         assert_eq!(v1.value.label(), v2.value.label());
@@ -285,11 +356,17 @@ mod test {
     fn test_wallclock_order() {
         let v1 = VersionedCrdsValue::new(
             1,
-            CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::default(), 1)),
+            CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+                &Pubkey::default(),
+                1,
+            ))),
         );
         let v2 = VersionedCrdsValue::new(
             1,
-            CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::default(), 0)),
+            CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+                &Pubkey::default(),
+                0,
+            ))),
         );
         assert_eq!(v1.value.label(), v2.value.label());
         assert!(v1 > v2);
@@ -301,11 +378,17 @@ mod test {
     fn test_label_order() {
         let v1 = VersionedCrdsValue::new(
             1,
-            CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0)),
+            CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+                &Pubkey::new_rand(),
+                0,
+            ))),
         );
         let v2 = VersionedCrdsValue::new(
             1,
-            CrdsValue::ContactInfo(ContactInfo::new_localhost(&Pubkey::new_rand(), 0)),
+            CrdsValue::new_unsigned(CrdsData::ContactInfo(ContactInfo::new_localhost(
+                &Pubkey::new_rand(),
+                0,
+            ))),
         );
         assert_ne!(v1, v2);
         assert!(!(v1 == v2));

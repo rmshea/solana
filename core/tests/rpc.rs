@@ -34,7 +34,11 @@ fn test_rpc_send_tx() {
         .send()
         .unwrap();
     let json: Value = serde_json::from_str(&response.text().unwrap()).unwrap();
-    let blockhash: Hash = json["result"][0].as_str().unwrap().parse().unwrap();
+    let blockhash: Hash = json["result"]["value"][0]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
 
     info!("blockhash: {:?}", blockhash);
     let tx = system_transaction::transfer(&alice, &bob_pubkey, 20, blockhash);
@@ -78,7 +82,7 @@ fn test_rpc_send_tx() {
         let response_json_text = response.text().unwrap();
         let json: Value = serde_json::from_str(&response_json_text).unwrap();
 
-        if true == json["result"] {
+        if true == json["result"]["value"] {
             confirmed_tx = true;
             break;
         }
@@ -87,6 +91,77 @@ fn test_rpc_send_tx() {
     }
 
     assert_eq!(confirmed_tx, true);
+
+    server.close().unwrap();
+    remove_dir_all(ledger_path).unwrap();
+}
+
+#[test]
+fn test_rpc_invalid_requests() {
+    solana_logger::setup();
+
+    let (server, leader_data, _alice, ledger_path) = new_validator_for_tests();
+    let bob_pubkey = Pubkey::new_rand();
+
+    // test invalid get_balance request
+    let client = reqwest::Client::new();
+    let request = json!({
+       "jsonrpc": "2.0",
+       "id": 1,
+       "method": "getBalance",
+       "params": json!(["invalid9999"])
+    });
+    let rpc_addr = leader_data.rpc;
+    let rpc_string = get_rpc_request_str(rpc_addr, false);
+    let mut response = client
+        .post(&rpc_string)
+        .header(CONTENT_TYPE, "application/json")
+        .body(request.to_string())
+        .send()
+        .unwrap();
+    let json: Value = serde_json::from_str(&response.text().unwrap()).unwrap();
+    let the_error = json["error"]["message"].as_str().unwrap();
+    assert_eq!(the_error, "Invalid request");
+
+    // test invalid get_account_info request
+    let client = reqwest::Client::new();
+    let request = json!({
+       "jsonrpc": "2.0",
+       "id": 1,
+       "method": "getAccountInfo",
+       "params": json!(["invalid9999"])
+    });
+    let rpc_addr = leader_data.rpc;
+    let rpc_string = get_rpc_request_str(rpc_addr, false);
+    let mut response = client
+        .post(&rpc_string)
+        .header(CONTENT_TYPE, "application/json")
+        .body(request.to_string())
+        .send()
+        .unwrap();
+    let json: Value = serde_json::from_str(&response.text().unwrap()).unwrap();
+    let the_error = json["error"]["message"].as_str().unwrap();
+    assert_eq!(the_error, "Invalid request");
+
+    // test invalid get_account_info request
+    let client = reqwest::Client::new();
+    let request = json!({
+       "jsonrpc": "2.0",
+       "id": 1,
+       "method": "getAccountInfo",
+       "params": json!([bob_pubkey.to_string()])
+    });
+    let rpc_addr = leader_data.rpc;
+    let rpc_string = get_rpc_request_str(rpc_addr, false);
+    let mut response = client
+        .post(&rpc_string)
+        .header(CONTENT_TYPE, "application/json")
+        .body(request.to_string())
+        .send()
+        .unwrap();
+    let json: Value = serde_json::from_str(&response.text().unwrap()).unwrap();
+    let the_value = &json["result"]["value"];
+    assert!(the_value.is_null());
 
     server.close().unwrap();
     remove_dir_all(ledger_path).unwrap();

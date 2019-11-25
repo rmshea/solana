@@ -18,13 +18,13 @@ The result of interpreting all programs on the ledger at a given [tick height](t
 
 A contiguous set of [entries](terminology.md#entry) on the ledger covered by a [vote](terminology.md#ledger-vote). A [leader](terminology.md#leader) produces at most one block per [slot](terminology.md#slot).
 
+## blockhash
+
+A preimage resistant [hash](terminology.md#hash) of the [ledger](terminology.md#ledger) at a given [block height](terminology.md#block-height). Taken from the last [entry id](terminology.md#entry-id) in the slot
+
 ## block height
 
-The number of [blocks](terminology.md#block) beneath the current block. The first block after the [genesis block](terminology.md#genesis-block) has height zero.
-
-## block id
-
-The [entry id](terminology.md#entry-id) of the last entry in a [block](terminology.md#block).
+The number of [blocks](terminology.md#block) beneath the current block. The first block after the [genesis block](terminology.md#genesis-block) has height one.
 
 ## bootstrap leader
 
@@ -72,7 +72,13 @@ An entry on the [ledger](terminology.md#ledger) either a [tick](terminology.md#t
 
 ## entry id
 
-A globally unique identifier that is also a proof that the [entry](terminology.md#entry) was generated after a duration of time, all [transactions](terminology.md#transaction) included in the entry, and all previous entries on the [ledger](terminology.md#ledger). See [Proof of History](terminology.md#proof-of-history).
+A preimage resistant [hash](terminology.md#hash) over the final contents of an entry, which acts as the [entry's](terminology.md#entry) globally unique identifier. The hash serves as evidence of:
+
+ * The entry being generated after a duration of time
+ * The specified [transactions](terminology.md#transaction) are those included in the entry
+ * The entry's position with respect to other entries in [ledger](terminology.md#ledger)
+
+See [Proof of History](terminology.md#proof-of-history).
 
 ## epoch
 
@@ -84,7 +90,7 @@ A proof which has the same format as a storage proof, but the sha state is actua
 
 ## fee account
 
-The fee account in the transaction is the account pays for the cost of including the transaction in the ledger. This is the first account in the transaction. This account must be declared as Credit-Debit in the transaction since paying for the transaction reduces the account balance.
+The fee account in the transaction is the account pays for the cost of including the transaction in the ledger. This is the first account in the transaction. This account must be declared as Read-Write (writable) in the transaction since paying for the transaction reduces the account balance.
 
 ## finality
 
@@ -96,7 +102,11 @@ A [ledger](terminology.md#ledger) derived from common entries but then diverged.
 
 ## genesis block
 
-The configuration file that prepares the [ledger](terminology.md#ledger) for the first [block](terminology.md#block).
+The first [block](terminology.md#block) in the chain.
+
+## genesis config
+
+The configuration file that prepares the [ledger](terminology.md#ledger) for the [genesis block](terminology.md#genesis-block).
 
 ## hash
 
@@ -112,11 +122,7 @@ A [public key](terminology.md#public-key) and corresponding [private key](termin
 
 ## lamport
 
-A fractional [native token](terminology.md#native-token) with the value of approximately 0.0000000000582 [sol](terminology.md#sol) \(2^-34\).
-
-## loader
-
-A [program](terminology.md#program) with the ability to interpret the binary encoding of other on-chain programs.
+A fractional [native token](terminology.md#native-token) with the value of 0.000000001 [sol](terminology.md#sol).
 
 ## leader
 
@@ -132,7 +138,7 @@ A list of [entries](terminology.md#entry) containing [transactions](terminology.
 
 ## ledger segment
 
-Portion of the ledger which is downloaded by the replicator where storage proof data is derived.
+Portion of the ledger which is downloaded by the archiver where storage proof data is derived.
 
 ## ledger vote
 
@@ -141,6 +147,10 @@ A [hash](terminology.md#hash) of the [validator's state](terminology.md#bank-sta
 ## light client
 
 A type of [client](terminology.md#client) that can verify it's pointing to a valid [cluster](terminology.md#cluster). It performs more ledger verification than a [thin client](terminology.md#thin-client) and less than a [validator](terminology.md#validator).
+
+## loader
+
+A [program](terminology.md#program) with the ability to interpret the binary encoding of other on-chain programs.
 
 ## lockout
 
@@ -186,9 +196,9 @@ A stack of proofs, each which proves that some data existed before the proof was
 
 The public key of a [keypair](terminology.md#keypair).
 
-## replicator
+## archiver
 
-Storage mining client, stores some part of the ledger enumerated in blocks and submits storage proofs to the chain. Not a full-node.
+Storage mining client, stores some part of the ledger enumerated in blocks and submits storage proofs to the chain. Not a validator.
 
 ## root
 
@@ -224,7 +234,7 @@ A set of sha hash state which is constructed by sampling the encrypted version o
 
 ## storage proof challenge
 
-A transaction from a replicator that verifiably proves that a validator confirmed a fake proof.
+A transaction from an archiver that verifiably proves that a validator confirmed a fake proof.
 
 ## storage proof claim
 
@@ -293,4 +303,3 @@ A reward tally for validators. A vote credit is awarded to a validator in its vo
 ## warmup period
 
 Some number of epochs after stake has been delegated while it progressively becomes effective. During this period, the stake is considered to be "activating". More info about: [warmup and cooldown](cluster/stake-delegation-and-rewards.md#stake-warmup-cooldown-withdrawal)
-

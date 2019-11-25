@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 #
-# This script is to be run on the bootstrap full node
+# This script is to be run on the bootstrap validator
 #
 
 cd "$(dirname "$0")"/../..
@@ -33,16 +33,12 @@ missing() {
 [[ -n $numNodes ]]       || missing numNodes
 [[ -n $failOnValidatorBootupFailure ]] || missing failOnValidatorBootupFailure
 
-validatorSanity=true
 installCheck=true
 rejectExtraNodes=false
 while [[ $1 = -o ]]; do
   opt="$2"
   shift 2
   case $opt in
-  noValidatorSanity)
-    validatorSanity=false
-    ;;
   noInstallCheck)
     installCheck=false
     ;;
@@ -70,7 +66,6 @@ local|tar|skip)
   solana_cli=solana
   solana_gossip=solana-gossip
   solana_install=solana-install
-  solana_keygen=solana-keygen
   ;;
 *)
   echo "Unknown deployment method: $deployMethod"
@@ -89,11 +84,8 @@ fi
 
 echo "+++ $sanityTargetIp: validators"
 (
-  # Ensure solana-cli has a keypair even though it doesn't really need one...
-  # TODO: Remove when https://github.com/solana-labs/solana/issues/6375 is fixed
-  $solana_keygen new --force -o temp-id.json
   set -x
-  $solana_cli --keypair temp-id.json --url http://"$sanityTargetIp":8899 show-validators
+  $solana_cli --url http://"$sanityTargetIp":8899 show-validators
 )
 
 echo "+++ $sanityTargetIp: node count ($numSanityNodes expected)"
@@ -105,8 +97,8 @@ echo "+++ $sanityTargetIp: node count ($numSanityNodes expected)"
     nodeArg="num-nodes-exactly"
   fi
 
-  $solana_gossip --entrypoint "$sanityTargetIp:8001" \
-    spy --$nodeArg "$numSanityNodes" --timeout 60 \
+  $solana_gossip spy --entrypoint "$sanityTargetIp:8001" \
+    --$nodeArg "$numSanityNodes" --timeout 60 \
 )
 
 echo "--- $sanityTargetIp: RPC API: getTransactionCount"
@@ -127,29 +119,6 @@ if [[ "$airdropsEnabled" = true ]]; then
 else
   echo "^^^ +++"
   echo "Note: wallet sanity is disabled as airdrops are disabled"
-fi
-
-echo "--- $sanityTargetIp: validator sanity"
-if $validatorSanity; then
-  (
-    set -x -o pipefail
-    timeout 10s ./multinode-demo/validator-x.sh \
-      --no-restart --entrypoint "$sanityTargetIp:8001" 2>&1 | tee validator-sanity.log
-  ) || {
-    exitcode=$?
-    [[ $exitcode -eq 124 ]] || exit $exitcode
-  }
-  wc -l validator-sanity.log
-  if grep -C100 panic validator-sanity.log; then
-    echo "^^^ +++"
-    echo "Panic observed"
-    exit 1
-  else
-    echo "Validator sanity log looks ok"
-  fi
-else
-  echo "^^^ +++"
-  echo "Note: validator sanity disabled"
 fi
 
 if $installCheck && [[ -r update_manifest_keypair.json ]]; then

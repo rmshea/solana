@@ -12,11 +12,10 @@ source ci/_
 : "${CI_COMMIT:=local}"
 reportName="lcov-${CI_COMMIT:0:9}"
 
-if [[ -n $1 ]]; then
-  crate="--package $1"
-  shift
+if [[ -z $1 ]]; then
+  packages=( --lib --all --exclude solana-local-cluster )
 else
-  crate="--all --exclude solana-local-cluster"
+  packages=( "$@" )
 fi
 
 coverageFlags=(-Zprofile)                # Enable coverage
@@ -25,7 +24,7 @@ coverageFlags+=("-Ccodegen-units=1")     # Disable code generation parallelism w
 coverageFlags+=("-Cinline-threshold=0")  # Disable inlining, which complicates control flow.
 coverageFlags+=("-Coverflow-checks=off") # Disable overflow checks, which create unnecessary branches.
 
-export RUSTFLAGS="${coverageFlags[*]}"
+export RUSTFLAGS="${coverageFlags[*]} $RUSTFLAGS"
 export CARGO_INCREMENTAL=0
 export RUST_BACKTRACE=1
 export RUST_MIN_STACK=8388608
@@ -37,10 +36,9 @@ fi
 rm -rf target/cov/$reportName
 
 source ci/rust-version.sh nightly
-# shellcheck disable=SC2086 #
-RUST_LOG=solana=trace _ cargo +$rust_nightly test --target-dir target/cov --lib --no-run $crate "$@"
-# shellcheck disable=SC2086 #
-RUST_LOG=solana=trace _ cargo +$rust_nightly test --target-dir target/cov --lib $crate "$@" 2> target/cov/coverage-stderr.log
+
+RUST_LOG=solana=trace _ cargo +$rust_nightly test --target-dir target/cov --no-run "${packages[@]}"
+RUST_LOG=solana=trace _ cargo +$rust_nightly test --target-dir target/cov "${packages[@]}" 2> target/cov/coverage-stderr.log
 
 echo "--- grcov"
 

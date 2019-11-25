@@ -114,7 +114,7 @@ GCE_ZONES=(
   europe-west4-c
 )
 
-# GCE zones with enough quota for one CPU-only fullnode
+# GCE zones with enough quota for one CPU-only validator
 GCE_LOW_QUOTA_ZONES=(
   asia-east2-a
   asia-northeast1-b
@@ -216,7 +216,7 @@ maybe_deploy_software() {
   (
     echo "--- net.sh restart"
     set -x
-    time net/net.sh restart --skip-setup -t "$CHANNEL_OR_TAG" "$arg"
+    time net/net.sh restart --skip-setup -t "$CHANNEL_OR_TAG" --skip-poh-verify "$arg"
   ) || ok=false
   if ! $ok; then
     net/net.sh logs
@@ -231,7 +231,6 @@ sanity() {
     (
       set -x
       NO_INSTALL_CHECK=1 \
-      NO_VALIDATOR_SANITY=1 \
         ci/testnet-sanity.sh edge-testnet-solana-com gce -P us-west1-b
       maybe_deploy_software
     )
@@ -240,7 +239,6 @@ sanity() {
     (
       set -x
       REJECT_EXTRA_NODES=1 \
-      NO_VALIDATOR_SANITY=1 \
         ci/testnet-sanity.sh edge-perf-testnet-solana-com ec2 us-west-2b
     )
     ;;
@@ -248,7 +246,6 @@ sanity() {
     (
       set -x
       NO_INSTALL_CHECK=1 \
-      NO_VALIDATOR_SANITY=1 \
         ci/testnet-sanity.sh beta-testnet-solana-com gce us-west1-b
       maybe_deploy_software --deploy-if-newer
     )
@@ -257,22 +254,19 @@ sanity() {
     (
       set -x
       REJECT_EXTRA_NODES=1 \
-      NO_VALIDATOR_SANITY=1 \
         ci/testnet-sanity.sh beta-perf-testnet-solana-com ec2 us-west-2b
     )
     ;;
   testnet)
     (
       set -x
-      NO_VALIDATOR_SANITY=1 \
-        ci/testnet-sanity.sh testnet-solana-com gce us-west1-b
+      ci/testnet-sanity.sh testnet-solana-com gce us-west1-b
     )
     ;;
   testnet-perf)
     (
       set -x
       REJECT_EXTRA_NODES=1 \
-      NO_VALIDATOR_SANITY=1 \
         ci/testnet-sanity.sh perf-testnet-solana-com gce us-west1-b
       #ci/testnet-sanity.sh perf-testnet-solana-com ec2 us-east-1a
     )
@@ -283,8 +277,7 @@ sanity() {
 
       ok=true
       if [[ -n $GCE_NODE_COUNT ]]; then
-        NO_VALIDATOR_SANITY=1 \
-          ci/testnet-sanity.sh demo-testnet-solana-com gce "${GCE_ZONES[0]}" -f || ok=false
+        ci/testnet-sanity.sh demo-testnet-solana-com gce "${GCE_ZONES[0]}" -f || ok=false
       else
         echo "Error: no GCE nodes"
         ok=false
@@ -295,8 +288,7 @@ sanity() {
   tds)
     (
       set -x
-      NO_VALIDATOR_SANITY=1 \
-        ci/testnet-sanity.sh tds-solana-com gce "${GCE_ZONES[0]}" -f
+      ci/testnet-sanity.sh tds-solana-com gce "${GCE_ZONES[0]}" -f
     )
     ;;
   *)
@@ -345,7 +337,6 @@ deploy() {
   testnet-edge-perf)
     (
       set -x
-      NO_VALIDATOR_SANITY=1 \
       RUST_LOG=solana=warn \
         ci/testnet-deploy.sh -p edge-perf-testnet-solana-com -C ec2 -z us-west-2b \
           -g -t "$CHANNEL_OR_TAG" -c 2 \
@@ -371,7 +362,6 @@ deploy() {
   testnet-beta-perf)
     (
       set -x
-      NO_VALIDATOR_SANITY=1 \
       RUST_LOG=solana=warn \
         ci/testnet-deploy.sh -p beta-perf-testnet-solana-com -C ec2 -z us-west-2b \
           -g -t "$CHANNEL_OR_TAG" -c 2 \
@@ -396,13 +386,12 @@ deploy() {
     (
       echo "--- net.sh update"
       set -x
-      time net/net.sh update -t edge --platform linux --platform osx --platform windows
+      time net/net.sh update -t "$CHANNEL_OR_TAG" --platform linux --platform osx --platform windows
     )
     ;;
   testnet-perf)
     (
       set -x
-      NO_VALIDATOR_SANITY=1 \
       RUST_LOG=solana=warn \
         ci/testnet-deploy.sh -p perf-testnet-solana-com -C gce -z us-west1-b \
           -G "--machine-type n1-standard-16 --accelerator count=2,type=nvidia-tesla-v100" \
@@ -423,26 +412,24 @@ deploy() {
       fi
 
       # shellcheck disable=SC2068
-      NO_VALIDATOR_SANITY=1 \
-        ci/testnet-deploy.sh -p demo-testnet-solana-com -C gce ${GCE_ZONE_ARGS[@]} \
-          -t "$CHANNEL_OR_TAG" -n "$GCE_NODE_COUNT" -c 0 -P -u --allow-boot-failures \
-          --skip-remote-log-retrieval \
-          -a demo-testnet-solana-com \
-          ${skipCreate:+-e} \
-          ${maybeSkipStart:+-s} \
-          ${maybeStop:+-S} \
-          ${maybeDelete:+-D}
+      ci/testnet-deploy.sh -p demo-testnet-solana-com -C gce ${GCE_ZONE_ARGS[@]} \
+        -t "$CHANNEL_OR_TAG" -n "$GCE_NODE_COUNT" -c 0 -P -u --allow-boot-failures \
+        --skip-remote-log-retrieval \
+        -a demo-testnet-solana-com \
+        ${skipCreate:+-e} \
+        ${maybeSkipStart:+-s} \
+        ${maybeStop:+-S} \
+        ${maybeDelete:+-D}
 
       if [[ -n $GCE_LOW_QUOTA_NODE_COUNT ]]; then
         # shellcheck disable=SC2068
-        NO_VALIDATOR_SANITY=1 \
-          ci/testnet-deploy.sh -p demo-testnet-solana-com2 -C gce ${GCE_LOW_QUOTA_ZONE_ARGS[@]} \
-            -t "$CHANNEL_OR_TAG" -n "$GCE_LOW_QUOTA_NODE_COUNT" -c 0 -P --allow-boot-failures -x \
-            --skip-remote-log-retrieval \
-            ${skipCreate:+-e} \
-            ${skipStart:+-s} \
-            ${maybeStop:+-S} \
-            ${maybeDelete:+-D}
+        ci/testnet-deploy.sh -p demo-testnet-solana-com2 -C gce ${GCE_LOW_QUOTA_ZONE_ARGS[@]} \
+          -t "$CHANNEL_OR_TAG" -n "$GCE_LOW_QUOTA_NODE_COUNT" -c 0 -P --allow-boot-failures -x \
+          --skip-remote-log-retrieval \
+          ${skipCreate:+-e} \
+          ${skipStart:+-s} \
+          ${maybeStop:+-S} \
+          ${maybeDelete:+-D}
       fi
     )
     ;;
@@ -492,7 +479,7 @@ deploy() {
       fi
 
       if [[ -z $INTERNAL_NODES_STAKE_LAMPORTS ]]; then
-        maybeInternalNodesStakeLamports="--internal-nodes-stake-lamports 1000000000000"
+        maybeInternalNodesStakeLamports="--internal-nodes-stake-lamports 1000000000" # 1 SOL
       elif [[ $INTERNAL_NODES_STAKE_LAMPORTS == skip ]]; then
         maybeInternalNodesStakeLamports=""
       else
@@ -500,7 +487,7 @@ deploy() {
       fi
 
       if [[ -z $INTERNAL_NODES_LAMPORTS ]]; then
-        maybeInternalNodesLamports="--internal-nodes-lamports 2000000000000"
+        maybeInternalNodesLamports="--internal-nodes-lamports 2000000000" # 2 SOL
       elif [[ $INTERNAL_NODES_LAMPORTS == skip ]]; then
         maybeInternalNodesLamports=""
       else
@@ -519,47 +506,39 @@ deploy() {
         maybeExternalAccountsFile="--external-accounts-file ${EXTERNAL_ACCOUNTS_FILE}"
       fi
 
-      if [[ -z $LAMPORTS ]]; then
-        maybeLamports="--lamports 8589934592000000000"
-      elif [[ $LAMPORTS == skip ]]; then
-        maybeLamports=""
-      else
-        maybeLamports="--lamports ${LAMPORTS}"
-      fi
-
       if [[ -z $ADDITIONAL_DISK_SIZE_GB ]]; then
-        maybeAdditionalDisk="--fullnode-additional-disk-size-gb 32000"
+        maybeAdditionalDisk="--validator-additional-disk-size-gb 32000"
       elif [[ $ADDITIONAL_DISK_SIZE_GB == skip ]]; then
         maybeAdditionalDisk=""
       else
-        maybeAdditionalDisk="--fullnode-additional-disk-size-gb ${ADDITIONAL_DISK_SIZE_GB}"
+        maybeAdditionalDisk="--validator-additional-disk-size-gb ${ADDITIONAL_DISK_SIZE_GB}"
       fi
-
 
       # Multiple V100 GPUs are available in us-west1, us-central1 and europe-west4
       # shellcheck disable=SC2068
       # shellcheck disable=SC2086
-      NO_VALIDATOR_SANITY=1 \
-        ci/testnet-deploy.sh -p tds-solana-com -C gce \
-          "${maybeGpu[@]}" \
-          -d pd-ssd \
-          ${GCE_CLOUD_ZONES[@]/#/-z } \
-          -t "$CHANNEL_OR_TAG" \
-          -n ${TDS_NODE_COUNT} \
-          -c ${TDS_CLIENT_COUNT} \
-          -P -u \
-          -a tds-solana-com --letsencrypt tds.solana.com \
-          ${maybeHashesPerTick} \
-          ${skipCreate:+-e} \
-          ${skipStart:+-s} \
-          ${maybeStop:+-S} \
-          ${maybeDelete:+-D} \
-          ${maybeDisableAirdrops} \
-          ${maybeInternalNodesStakeLamports} \
-          ${maybeInternalNodesLamports} \
-          ${maybeExternalAccountsFile} \
-          ${maybeLamports} \
-          ${maybeAdditionalDisk}
+      ci/testnet-deploy.sh -p tds-solana-com -C gce \
+        "${maybeGpu[@]}" \
+        -d pd-ssd \
+        ${GCE_CLOUD_ZONES[@]/#/-z } \
+        -t "$CHANNEL_OR_TAG" \
+        -n ${TDS_NODE_COUNT} \
+        -c ${TDS_CLIENT_COUNT} \
+        --idle-clients \
+        -P -u \
+        -a tds-solana-com --letsencrypt tds.solana.com \
+        ${maybeHashesPerTick} \
+        ${skipCreate:+-e} \
+        ${skipStart:+-s} \
+        ${maybeStop:+-S} \
+        ${maybeDelete:+-D} \
+        ${maybeDisableAirdrops} \
+        ${maybeInternalNodesStakeLamports} \
+        ${maybeInternalNodesLamports} \
+        ${maybeExternalAccountsFile} \
+        --target-lamports-per-signature 0 \
+        --slots-per-epoch 4096 \
+        ${maybeAdditionalDisk}
     )
     ;;
   *)
@@ -650,20 +629,7 @@ sanity-or-restart)
   else
     echo "+++ Sanity failed, updating the network"
     $metricsWriteDatapoint "testnet-manager sanity-failure=1"
-
-    # TODO: Restore attempt to restart the cluster before recreating it
-    #       See https://github.com/solana-labs/solana/issues/3774
-    if false; then
-      if start; then
-        echo Update successful
-      else
-        echo "+++ Update failed, restarting the network"
-        $metricsWriteDatapoint "testnet-manager update-failure=1"
-        create-and-start
-      fi
-    else
-      create-and-start
-    fi
+    create-and-start
   fi
   ;;
 *)

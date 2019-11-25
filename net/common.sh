@@ -12,8 +12,7 @@ netDir=$(
   echo "$PWD"
 )
 netConfigDir="$netDir"/config
-netLogDir="$netDir"/log
-mkdir -p "$netConfigDir" "$netLogDir"
+mkdir -p "$netConfigDir"
 
 SOLANA_ROOT="$netDir"/..
 # shellcheck source=scripts/configure-metrics.sh
@@ -29,18 +28,18 @@ sshPrivateKey=
 letsEncryptDomainName=
 externalNodeSshKey=
 sshOptions=()
-fullnodeIpList=()
-fullnodeIpListPrivate=()
-fullnodeIpListZone=()
+validatorIpList=()
+validatorIpListPrivate=()
+validatorIpListZone=()
 clientIpList=()
 clientIpListPrivate=()
 clientIpListZone=()
 blockstreamerIpList=()
 blockstreamerIpListPrivate=()
 blockstreamerIpListZone=()
-replicatorIpList=()
-replicatorIpListPrivate=()
-replicatorIpListZone=()
+archiverIpList=()
+archiverIpListPrivate=()
+archiverIpListZone=()
 
 buildSshOptions() {
   sshOptions=(
@@ -64,14 +63,14 @@ loadConfigFile() {
   [[ -n "$publicNetwork" ]] || usage "Config file invalid, publicNetwork unspecified: $configFile"
   [[ -n "$netBasename" ]] || usage "Config file invalid, netBasename unspecified: $configFile"
   [[ -n $sshPrivateKey ]] || usage "Config file invalid, sshPrivateKey unspecified: $configFile"
-  [[ ${#fullnodeIpList[@]} -gt 0 ]] || usage "Config file invalid, fullnodeIpList unspecified: $configFile"
-  [[ ${#fullnodeIpListPrivate[@]} -gt 0 ]] || usage "Config file invalid, fullnodeIpListPrivate unspecified: $configFile"
-  [[ ${#fullnodeIpList[@]} -eq ${#fullnodeIpListPrivate[@]} ]] || usage "Config file invalid, fullnodeIpList/fullnodeIpListPrivate length mismatch: $configFile"
+  [[ ${#validatorIpList[@]} -gt 0 ]] || usage "Config file invalid, validatorIpList unspecified: $configFile"
+  [[ ${#validatorIpListPrivate[@]} -gt 0 ]] || usage "Config file invalid, validatorIpListPrivate unspecified: $configFile"
+  [[ ${#validatorIpList[@]} -eq ${#validatorIpListPrivate[@]} ]] || usage "Config file invalid, validatorIpList/validatorIpListPrivate length mismatch: $configFile"
 
   if $publicNetwork; then
-    entrypointIp=${fullnodeIpList[0]}
+    entrypointIp=${validatorIpList[0]}
   else
-    entrypointIp=${fullnodeIpListPrivate[0]}
+    entrypointIp=${validatorIpListPrivate[0]}
   fi
 
   buildSshOptions
@@ -99,6 +98,9 @@ SOLANA_CONFIG_DIR=$SOLANA_ROOT/config
 # Clear the current cluster configuration
 clear_config_dir() {
   declare config_dir="$1"
+
+  _setup_secondary_mount
+
   (
     set -x
     rm -rf "${config_dir:?}/" # <-- $i might be a symlink, rm the other side of it first
@@ -106,17 +108,19 @@ clear_config_dir() {
     mkdir -p "$config_dir"
   )
 
-  setup_secondary_mount
+  _setup_secondary_mount
 }
 
 SECONDARY_DISK_MOUNT_POINT=/mnt/extra-disk
-setup_secondary_mount() {
+_setup_secondary_mount() {
   # If there is a secondary disk, symlink the config/ dir there
-  if [[ -d $SECONDARY_DISK_MOUNT_POINT ]] && \
-    [[ -w $SECONDARY_DISK_MOUNT_POINT ]]; then
-    mkdir -p $SECONDARY_DISK_MOUNT_POINT/config
-    rm -rf "$SOLANA_CONFIG_DIR"
-    ln -sfT $SECONDARY_DISK_MOUNT_POINT/config "$SOLANA_CONFIG_DIR"
-  fi
+  (
+    set -x
+    if [[ -d $SECONDARY_DISK_MOUNT_POINT ]] && \
+      [[ -w $SECONDARY_DISK_MOUNT_POINT ]]; then
+      mkdir -p $SECONDARY_DISK_MOUNT_POINT/config
+      rm -rf "$SOLANA_CONFIG_DIR"
+      ln -sfT $SECONDARY_DISK_MOUNT_POINT/config "$SOLANA_CONFIG_DIR"
+    fi
+  )
 }
-

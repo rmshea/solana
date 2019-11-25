@@ -1,21 +1,23 @@
 use bincode::{deserialize, serialize};
+use ed25519_dalek::{SignatureError, KEYPAIR_LENGTH, PUBLIC_KEY_LENGTH};
 use libc::{c_int, size_t};
 use rand_chacha::ChaChaRng;
 use rand_core::SeedableRng;
-use solana_ed25519_dalek::{SignatureError, KEYPAIR_LENGTH, PUBLIC_KEY_LENGTH};
-use solana_sdk::hash::Hash;
-use solana_sdk::instruction::CompiledInstruction as CompiledInstructionNative;
-use solana_sdk::message::Message as MessageNative;
-use solana_sdk::message::MessageHeader as MessageHeaderNative;
-use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Signature as SignatureNative;
-use solana_sdk::signature::{Keypair as KeypairNative, KeypairUtil};
-use solana_sdk::transaction::Transaction as TransactionNative;
-use std::convert::TryInto;
-use std::ffi::CString;
-use std::os::raw::c_char;
-use std::vec::Vec;
-use std::{fmt, mem, ptr, slice};
+use solana_sdk::{
+    hash::Hash,
+    instruction::CompiledInstruction as CompiledInstructionNative,
+    message::{Message as MessageNative, MessageHeader as MessageHeaderNative},
+    pubkey::Pubkey,
+    signature::{Keypair as KeypairNative, KeypairUtil, Signature as SignatureNative},
+    transaction::Transaction as TransactionNative,
+};
+use std::{
+    convert::TryInto,
+    ffi::CString,
+    os::raw::c_char,
+    vec::Vec,
+    {fmt, mem, ptr, slice},
+};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -42,6 +44,7 @@ impl Transaction {
         }
     }
 
+    /// # Safety
     pub unsafe fn into_native(self) -> TransactionNative {
         TransactionNative {
             signatures: CVec::into_native(self.signatures)
@@ -52,6 +55,7 @@ impl Transaction {
         }
     }
 
+    /// # Safety
     #[allow(clippy::should_implement_trait)]
     pub unsafe fn clone(&self) -> Self {
         Self {
@@ -64,7 +68,7 @@ impl Transaction {
 #[repr(C)]
 #[derive(Debug)]
 pub struct Message {
-    /// The message header, identifying signed and credit-only `account_keys`
+    /// The message header, identifying signed and read-only `account_keys`
     pub header: MessageHeader,
 
     /// All the account keys used by this transaction
@@ -164,30 +168,30 @@ pub struct MessageHeader {
     /// signatures must match the first `num_required_signatures` of `account_keys`.
     pub num_required_signatures: u8,
 
-    /// The last num_credit_only_signed_accounts of the signed keys are credit-only accounts.
-    /// Programs may process multiple transactions that add lamports to the same credit-only
-    /// account within a single PoH entry, but are not permitted to debit lamports or modify
-    /// account data. Transactions targeting the same debit account are evaluated sequentially.
-    pub num_credit_only_signed_accounts: u8,
+    /// The last num_readonly_signed_accounts of the signed keys are read-only accounts. Programs
+    /// may process multiple transactions that load read-only accounts within a single PoH entry,
+    /// but are not permitted to credit or debit lamports or modify account data. Transactions
+    /// targeting the same read-write account are evaluated sequentially.
+    pub num_readonly_signed_accounts: u8,
 
-    /// The last num_credit_only_unsigned_accounts of the unsigned keys are credit-only accounts.
-    pub num_credit_only_unsigned_accounts: u8,
+    /// The last num_readonly_unsigned_accounts of the unsigned keys are read-only accounts.
+    pub num_readonly_unsigned_accounts: u8,
 }
 
 impl MessageHeader {
     pub fn from_native(h: MessageHeaderNative) -> Self {
         Self {
             num_required_signatures: h.num_required_signatures,
-            num_credit_only_signed_accounts: h.num_credit_only_signed_accounts,
-            num_credit_only_unsigned_accounts: h.num_credit_only_unsigned_accounts,
+            num_readonly_signed_accounts: h.num_readonly_signed_accounts,
+            num_readonly_unsigned_accounts: h.num_readonly_unsigned_accounts,
         }
     }
 
     pub fn into_native(self) -> MessageHeaderNative {
         MessageHeaderNative {
             num_required_signatures: self.num_required_signatures,
-            num_credit_only_signed_accounts: self.num_credit_only_signed_accounts,
-            num_credit_only_unsigned_accounts: self.num_credit_only_unsigned_accounts,
+            num_readonly_signed_accounts: self.num_readonly_signed_accounts,
+            num_readonly_unsigned_accounts: self.num_readonly_unsigned_accounts,
         }
     }
 }
@@ -281,36 +285,43 @@ impl CVec<CompiledInstruction> {
     }
 }
 
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn free_transaction(tx: *mut Transaction) {
     Box::from_raw(tx);
 }
 
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn free_message(m: *mut Message) {
     Box::from_raw(m);
 }
 
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn free_message_header(mh: *mut MessageHeader) {
     Box::from_raw(mh);
 }
 
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn free_signature(s: *mut Signature) {
     Box::from_raw(s);
 }
 
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn free_compiled_instruction(i: *mut CompiledInstruction) {
     Box::from_raw(i);
 }
 
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn free_c_string(s: *mut c_char) {
     CString::from_raw(s);
 }
 
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn new_unsigned_transaction(message: *mut Message) -> *mut Transaction {
     let message = Box::from_raw(message);
@@ -325,6 +336,8 @@ pub unsafe extern "C" fn new_unsigned_transaction(message: *mut Message) -> *mut
 /// # Undefined Behavior
 ///
 /// Causes UB if `seed` is not a pointer to an array of length 32 or if `seed` is `NULL`
+///
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn generate_keypair(seed: *const u8) -> *mut Keypair {
     let seed = <&[u8] as TryInto<&[u8; PUBLIC_KEY_LENGTH]>>::try_into(slice::from_raw_parts(
@@ -343,6 +356,8 @@ pub unsafe extern "C" fn generate_keypair(seed: *const u8) -> *mut Keypair {
 /// # Undefined Behavior
 ///
 /// Causes UB if `keypair` is `NULL` or if `keypair` in not a pointer to a valid `Keypair`
+///
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn get_keypair_pubkey(keypair: *const Keypair) -> *mut Pubkey {
     let keypair = if let Ok(k) = (*keypair).new_native() {
@@ -360,6 +375,8 @@ pub unsafe extern "C" fn get_keypair_pubkey(keypair: *const Keypair) -> *mut Pub
 /// # Undefined Behavior
 ///
 /// Causes UB if any of the input pointers is `NULL`, or if `tx` is not a valid `Transaction`
+///
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn serialize_transaction(
     tx: *mut Transaction,
@@ -385,6 +402,8 @@ pub unsafe extern "C" fn serialize_transaction(
 /// # Undefined Behavior
 ///
 /// Causes UB if `bytes` is `NULL`, or if `bytes` does not point to a valid array of length `len`
+///
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn deserialize_transaction(
     bytes: *const u8,
@@ -408,6 +427,8 @@ pub unsafe extern "C" fn deserialize_transaction(
 ///
 /// Causes UB if any of the pointers is `NULL`, or if `keypairs` does not point to a valid array of
 /// `Keypairs` of length `num_keypairs`
+///
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn transaction_partial_sign(
     tx: *mut Transaction,
@@ -457,6 +478,8 @@ pub unsafe extern "C" fn transaction_partial_sign(
 ///
 /// Causes UB if `pubkey` is `NULL`, or if the returned c-string is freed by any method other than
 /// calling `free_c_string()`
+///
+/// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn get_pubkey_string(pubkey: *const Pubkey) -> *mut c_char {
     if let Ok(s) = CString::new(format!("{}", *pubkey)) {
@@ -481,7 +504,7 @@ mod tests {
         let mut rng = ChaChaRng::from_seed(seed);
         let keypair = KeypairNative::generate(&mut rng);
         let c_keypair = unsafe { Box::from_raw(generate_keypair(seed.as_ptr())) };
-        assert_eq!(c_keypair.new_native(), Ok(keypair));
+        assert_eq!(c_keypair.new_native().unwrap().pubkey(), keypair.pubkey());
     }
 
     #[test]
@@ -501,7 +524,7 @@ mod tests {
         let key = KeypairNative::new();
         let to = Pubkey::new_rand();
         let blockhash = Hash::default();
-        let tx = system_transaction::create_user_account(&key, &to, 50, blockhash);
+        let tx = system_transaction::transfer(&key, &to, 50, blockhash);
         let serialized = serialize(&tx).unwrap();
         let tx = Box::new(Transaction::from_native(tx));
         let tx = Box::into_raw(tx);
@@ -520,7 +543,7 @@ mod tests {
         let key = KeypairNative::new();
         let to = Pubkey::new_rand();
         let blockhash = Hash::default();
-        let tx = system_transaction::create_user_account(&key, &to, 50, blockhash);
+        let tx = system_transaction::transfer(&key, &to, 50, blockhash);
         let serialized = serialize(&tx).unwrap();
         let deserialized;
         unsafe {
@@ -559,8 +582,7 @@ mod tests {
         let key_native = KeypairNative::new();
         let to = Pubkey::new_rand();
         let blockhash = Hash::default();
-        let mut tx_native =
-            system_transaction::create_user_account(&key_native, &to, 50, blockhash);
+        let mut tx_native = system_transaction::transfer(&key_native, &to, 50, blockhash);
         let tx = Box::into_raw(Box::new(Transaction::from_native(tx_native.clone())));
         let key = Keypair::from_native(&key_native);
         let tx2;

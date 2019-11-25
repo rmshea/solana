@@ -15,8 +15,8 @@
   "editable": true,
   "gnetId": null,
   "graphTooltip": 0,
-  "id": 1038,
-  "iteration": 1571342384471,
+  "id": 1069,
+  "iteration": 1572390574899,
   "links": [
     {
       "asDropdown": true,
@@ -236,7 +236,7 @@
           "hide": false,
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT LAST(median) FROM ( SELECT median(count) FROM \"$testnet\".\"autogen\".\"cluster_info-num_nodes\" WHERE $timeFilter AND count > 0 GROUP BY time(5s) )\n",
+          "query": "SELECT LAST(median) FROM ( SELECT median(live_count) FROM \"$testnet\".\"autogen\".\"cluster_info-num_nodes\" WHERE $timeFilter AND live_count > 0 GROUP BY time(5s) )\n",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -1713,9 +1713,47 @@
           "hide": false,
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT median(\"count\") AS \"total\" FROM \"$testnet\".\"autogen\".\"cluster_info-num_nodes\" WHERE $timeFilter AND count > 0 GROUP BY time(5s)",
+          "query": "SELECT median(\"broadcast_count\") AS \"broadcast_total\" FROM \"$testnet\".\"autogen\".\"cluster_info-num_nodes\" WHERE $timeFilter AND broadcast_count > 0 GROUP BY time(5s)",
           "rawQuery": true,
-          "refId": "C",
+          "refId": "A",
+          "resultFormat": "time_series",
+          "select": [
+            [
+              {
+                "params": [
+                  "value"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": []
+        },
+        {
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "hide": false,
+          "orderByTime": "ASC",
+          "policy": "default",
+          "query": "SELECT median(\"live_count\") AS \"live_total\" FROM \"$testnet\".\"autogen\".\"cluster_info-num_nodes\" WHERE $timeFilter AND live_count > 0 GROUP BY time(5s)",
+          "rawQuery": true,
+          "refId": "B",
           "resultFormat": "time_series",
           "select": [
             [
@@ -4083,11 +4121,11 @@
             "rgba(237, 129, 40, 0.89)",
             "rgba(50, 172, 45, 0.97)"
           ],
-          "decimals": 2,
+          "decimals": 0,
           "pattern": "/.*/",
           "thresholds": [],
           "type": "number",
-          "unit": "short"
+          "unit": "none"
         }
       ],
       "targets": [
@@ -4109,7 +4147,7 @@
           "hide": false,
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT host_id, slot FROM \"$testnet\".\"autogen\".\"replay-stage-mark_dead_slot\"  WHERE $timeFilter ORDER BY time DESC ",
+          "query": "SELECT host_id, error, slot FROM \"$testnet\".\"autogen\".\"replay-stage-mark_dead_slot\"  WHERE $timeFilter ORDER BY time DESC ",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "table",
@@ -4317,7 +4355,7 @@
           "measurement": "cluster_info-vote-count",
           "orderByTime": "ASC",
           "policy": "autogen",
-          "query": "SELECT \"duration\" / 1000 as \"Generation Time\" FROM  \"$testnet\".\"autogen\".\"bench-tps-generate_txs\" WHERE $timeFilter fill(null)\n\n\n\n\n",
+          "query": "SELECT mean(\"duration\") as \"Generation Time\" FROM  \"$testnet\".\"autogen\".\"bench-tps-generate_txs\" WHERE $timeFilter GROUP BY time(1s)\n\n\n\n\n",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -4354,7 +4392,7 @@
           ],
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT \"duration\" / 1000 as \"Transmit Time\" FROM  \"$testnet\".\"autogen\".\"bench-tps-do_tx_transfers\" WHERE $timeFilter fill(null)",
+          "query": "SELECT mean(\"duration\")  as \"Transmit Time\" FROM  \"$testnet\".\"autogen\".\"bench-tps-do_tx_transfers\" WHERE $timeFilter GROUP BY time(1s)",
           "rawQuery": true,
           "refId": "B",
           "resultFormat": "time_series",
@@ -4391,9 +4429,46 @@
           ],
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT \"duration\" / 1000 as \"Barrier Transaction Confirmation Time\" FROM  \"$testnet\".\"autogen\".\"bench-tps-send_barrier_transaction\" WHERE $timeFilter fill(null)",
+          "query": "SELECT mean(\"duration\") as \"Get Blockhash\" FROM  \"$testnet\".\"autogen\".\"bench-tps-get_blockhash\" WHERE $timeFilter GROUP BY time(1s)",
           "rawQuery": true,
           "refId": "C",
+          "resultFormat": "time_series",
+          "select": [
+            [
+              {
+                "params": [
+                  "value"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": []
+        },
+        {
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "orderByTime": "ASC",
+          "policy": "default",
+          "query": "SELECT mean(\"duration\") as \"Get Balance\" FROM  \"$testnet\".\"autogen\".\"bench-tps-get_balance\" WHERE $timeFilter GROUP BY time(1s)",
+          "rawQuery": true,
+          "refId": "D",
           "resultFormat": "time_series",
           "select": [
             [
@@ -4432,7 +4507,7 @@
       },
       "yaxes": [
         {
-          "format": "short",
+          "format": "µs",
           "label": null,
           "logBase": 1,
           "max": null,
@@ -4454,12 +4529,97 @@
       }
     },
     {
+      "columns": [],
+      "datasource": "$datasource",
+      "fontSize": "100%",
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 50
+      },
+      "id": 68,
+      "links": [],
+      "pageSize": null,
+      "scroll": true,
+      "showHeader": true,
+      "sort": {
+        "col": null,
+        "desc": false
+      },
+      "styles": [
+        {
+          "alias": "Time",
+          "dateFormat": "YYYY-MM-DD HH:mm:ss",
+          "pattern": "Time",
+          "type": "date"
+        },
+        {
+          "alias": "",
+          "colorMode": null,
+          "colors": [
+            "rgba(245, 54, 54, 0.9)",
+            "rgba(237, 129, 40, 0.89)",
+            "rgba(50, 172, 45, 0.97)"
+          ],
+          "decimals": 2,
+          "pattern": "/.*/",
+          "thresholds": [],
+          "type": "number",
+          "unit": "short"
+        }
+      ],
+      "targets": [
+        {
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "hide": false,
+          "orderByTime": "ASC",
+          "policy": "default",
+          "query": "SELECT * FROM \"$testnet\".\"autogen\".\"ramp-tps\"  WHERE $timeFilter ORDER BY time DESC ",
+          "rawQuery": true,
+          "refId": "A",
+          "resultFormat": "table",
+          "select": [
+            [
+              {
+                "params": [
+                  "value"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": []
+        }
+      ],
+      "title": "Ramp TPS Events",
+      "transform": "table",
+      "type": "table"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 55
       },
       "id": 38,
       "panels": [],
@@ -4477,7 +4637,7 @@
         "h": 5,
         "w": 12,
         "x": 0,
-        "y": 51
+        "y": 56
       },
       "id": 39,
       "legend": {
@@ -4628,7 +4788,7 @@
         "h": 5,
         "w": 12,
         "x": 12,
-        "y": 51
+        "y": 56
       },
       "id": 40,
       "legend": {
@@ -4811,7 +4971,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 56
+        "y": 61
       },
       "id": 41,
       "panels": [],
@@ -4829,9 +4989,9 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 57
+        "y": 62
       },
-      "id": 50,
+      "id": 42,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -5148,9 +5308,9 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 57
+        "y": 62
       },
-      "id": 47,
+      "id": 43,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -5506,7 +5666,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 57
+        "y": 62
       },
       "id": 44,
       "legend": {
@@ -5818,9 +5978,9 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 63
+        "y": 68
       },
-      "id": 42,
+      "id": 45,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -6248,9 +6408,9 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 63
+        "y": 68
       },
-      "id": 46,
+      "id": 47,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -6291,7 +6451,7 @@
           ],
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT sum(\"count\") FROM \"$testnet\".\"autogen\".\"poh_recorder-tick_lock_contention\" WHERE host_id::tag =~ /$hostid/ AND $timeFilter GROUP BY time($__interval)",
+          "query": "SELECT mean(\"count\") FROM \"$testnet\".\"autogen\".\"poh_recorder-tick_lock_contention\" WHERE host_id::tag =~ /$hostid/ AND $timeFilter GROUP BY time($__interval)",
           "rawQuery": true,
           "refId": "F",
           "resultFormat": "time_series",
@@ -6328,7 +6488,7 @@
           ],
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT sum(\"count\") FROM \"$testnet\".\"autogen\".\"poh_recorder-record_lock_contention\" WHERE host_id::tag =~ /$hostid/ AND $timeFilter GROUP BY time($__interval)",
+          "query": "SELECT mean(\"count\") FROM \"$testnet\".\"autogen\".\"poh_recorder-record_lock_contention\" WHERE host_id::tag =~ /$hostid/ AND $timeFilter GROUP BY time($__interval)",
           "rawQuery": true,
           "refId": "A",
           "resultFormat": "time_series",
@@ -6365,9 +6525,46 @@
           ],
           "orderByTime": "ASC",
           "policy": "default",
-          "query": "SELECT sum(\"count\") FROM \"$testnet\".\"autogen\".\"poh_recorder-tick_overhead\" WHERE host_id::tag =~ /$hostid/ AND $timeFilter GROUP BY time($__interval)",
+          "query": "SELECT mean(\"count\") FROM \"$testnet\".\"autogen\".\"poh_recorder-tick_overhead\" WHERE host_id::tag =~ /$hostid/ AND $timeFilter GROUP BY time($__interval)",
           "rawQuery": true,
           "refId": "B",
+          "resultFormat": "time_series",
+          "select": [
+            [
+              {
+                "params": [
+                  "value"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": []
+        },
+        {
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "orderByTime": "ASC",
+          "policy": "default",
+          "query": "SELECT mean(\"count\") FROM \"$testnet\".\"autogen\".\"poh_recorder-record_ms\" WHERE host_id::tag =~ /$hostid/ AND $timeFilter GROUP BY time($__interval)",
+          "rawQuery": true,
+          "refId": "C",
           "resultFormat": "time_series",
           "select": [
             [
@@ -6405,7 +6602,7 @@
       },
       "yaxes": [
         {
-          "format": "ms",
+          "format": "µs",
           "label": null,
           "logBase": 1,
           "max": null,
@@ -6437,9 +6634,9 @@
         "h": 5,
         "w": 8,
         "x": 16,
-        "y": 63
+        "y": 68
       },
-      "id": 56,
+      "id": 47,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -6558,9 +6755,9 @@
         "h": 5,
         "w": 8,
         "x": 16,
-        "y": 68
+        "y": 73
       },
-      "id": 55,
+      "id": 48,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -6714,9 +6911,9 @@
         "h": 5,
         "w": 8,
         "x": 0,
-        "y": 69
+        "y": 74
       },
-      "id": 48,
+      "id": 49,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -6870,9 +7067,9 @@
         "h": 5,
         "w": 8,
         "x": 8,
-        "y": 69
+        "y": 74
       },
-      "id": 49,
+      "id": 50,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -6985,9 +7182,9 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 73
+        "y": 78
       },
-      "id": 53,
+      "id": 51,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -7189,9 +7386,9 @@
         "h": 5,
         "w": 8,
         "x": 0,
-        "y": 74
+        "y": 79
       },
-      "id": 45,
+      "id": 52,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -7491,9 +7688,9 @@
         "h": 5,
         "w": 8,
         "x": 8,
-        "y": 74
+        "y": 79
       },
-      "id": 51,
+      "id": 53,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -7639,9 +7836,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 79
+        "y": 84
       },
-      "id": 57,
+      "id": 54,
       "panels": [],
       "title": "Tower Consensus",
       "type": "row"
@@ -7662,9 +7859,9 @@
         "h": 5,
         "w": 8,
         "x": 0,
-        "y": 80
+        "y": 85
       },
-      "id": 58,
+      "id": 55,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -7822,9 +8019,9 @@
         "h": 5,
         "w": 8,
         "x": 8,
-        "y": 80
+        "y": 85
       },
-      "id": 54,
+      "id": 56,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -7982,9 +8179,9 @@
         "h": 5,
         "w": 8,
         "x": 16,
-        "y": 80
+        "y": 85
       },
-      "id": 59,
+      "id": 57,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -8167,9 +8364,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 85
+        "y": 90
       },
-      "id": 60,
+      "id": 58,
       "panels": [],
       "repeat": null,
       "title": "IP Network",
@@ -8186,9 +8383,9 @@
         "h": 5,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 91
       },
-      "id": 61,
+      "id": 59,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -8419,9 +8616,9 @@
         "h": 5,
         "w": 12,
         "x": 12,
-        "y": 86
+        "y": 91
       },
-      "id": 62,
+      "id": 60,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -8572,9 +8769,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 91
+        "y": 96
       },
-      "id": 63,
+      "id": 61,
       "panels": [],
       "title": "Signature Verification",
       "type": "row"
@@ -8590,9 +8787,9 @@
         "h": 5,
         "w": 12,
         "x": 0,
-        "y": 92
+        "y": 97
       },
-      "id": 64,
+      "id": 62,
       "legend": {
         "avg": false,
         "current": false,
@@ -8711,9 +8908,9 @@
         "h": 5,
         "w": 12,
         "x": 12,
-        "y": 92
+        "y": 97
       },
-      "id": 65,
+      "id": 63,
       "legend": {
         "alignAsTable": false,
         "avg": false,
@@ -8860,9 +9057,9 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 97
+        "y": 102
       },
-      "id": 66,
+      "id": 64,
       "panels": [],
       "title": "Snapshots",
       "type": "row"
@@ -8878,9 +9075,9 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 98
+        "y": 103
       },
-      "id": 67,
+      "id": 65,
       "legend": {
         "avg": false,
         "current": false,
@@ -9070,9 +9267,9 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 98
+        "y": 103
       },
-      "id": 68,
+      "id": 66,
       "legend": {
         "avg": false,
         "current": false,
@@ -9262,9 +9459,9 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 98
+        "y": 103
       },
-      "id": 69,
+      "id": 67,
       "legend": {
         "avg": false,
         "current": false,
@@ -9444,6 +9641,244 @@
         "align": false,
         "alignLevel": null
       }
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 109
+      },
+      "id": 74,
+      "panels": [],
+      "title": "Resources",
+      "type": "row"
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "$datasource",
+      "fill": 1,
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 110
+      },
+      "id": 70,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "connected",
+      "percentage": false,
+      "pointradius": 5,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "orderByTime": "ASC",
+          "policy": "default",
+          "query": "SELECT mean(\"cpu_usage\") as \"cpu_usage\" FROM \"$testnet\".\"autogen\".\"system-stats\" WHERE  hostname =~ /$hostid/ AND $timeFilter   GROUP BY time(5s) fill(null)\n",
+          "rawQuery": true,
+          "refId": "A",
+          "resultFormat": "time_series",
+          "select": [
+            [
+              {
+                "params": [
+                  "value"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": []
+        },
+        {
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "orderByTime": "ASC",
+          "policy": "default",
+          "query": "SELECT max(\"ram_usage\") as \"ram_usage\" FROM \"$testnet\".\"autogen\".\"system-stats\" WHERE  hostname =~ /$hostid/ AND $timeFilter   GROUP BY time(5s) fill(null)\n",
+          "rawQuery": true,
+          "refId": "B",
+          "resultFormat": "time_series",
+          "select": [
+            [
+              {
+                "params": [
+                  "value"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": []
+        },
+        {
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "orderByTime": "ASC",
+          "policy": "default",
+          "query": "SELECT mean(\"avg_gpu_usage\") as \"gpu_usage\" FROM \"$testnet\".\"autogen\".\"system-stats\" WHERE  hostname =~ /$hostid/ AND $timeFilter   GROUP BY time(5s) fill(null)\n",
+          "rawQuery": true,
+          "refId": "C",
+          "resultFormat": "time_series",
+          "select": [
+            [
+              {
+                "params": [
+                  "value"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": []
+        },
+        {
+          "groupBy": [
+            {
+              "params": [
+                "$__interval"
+              ],
+              "type": "time"
+            },
+            {
+              "params": [
+                "null"
+              ],
+              "type": "fill"
+            }
+          ],
+          "orderByTime": "ASC",
+          "policy": "default",
+          "query": "SELECT mean(\"avg_gpu_mem_usage\") as \"gpu_memory_usage\" FROM \"$testnet\".\"autogen\".\"system-stats\" WHERE  hostname =~ /$hostid/ AND $timeFilter   GROUP BY time(5s) fill(null)\n",
+          "rawQuery": true,
+          "refId": "D",
+          "resultFormat": "time_series",
+          "select": [
+            [
+              {
+                "params": [
+                  "value"
+                ],
+                "type": "field"
+              },
+              {
+                "params": [],
+                "type": "mean"
+              }
+            ]
+          ],
+          "tags": []
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeShift": null,
+      "title": "Resource Usage",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "percent",
+          "label": null,
+          "logBase": 1,
+          "max": "100",
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": false
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
     }
   ],
   "refresh": "60s",
@@ -9543,5 +9978,5 @@
   "timezone": "",
   "title": "Testnet Monitor (edge)",
   "uid": "testnet-edge",
-  "version": 6
+  "version": 2
 }

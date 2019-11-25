@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
 set -e
 
-# TODO: Make sure a dB named $TESTNET_TAG exists in the influxDB host, or can be created
-[[ -n $TESTNET_TAG ]] || TESTNET_TAG=testnet-automation
-[[ -n $INFLUX_HOST ]] || INFLUX_HOST=https://metrics.solana.com:8086
-
-# TODO: Remove all default values, force explicitness in the testcase definition
-[[ -n $TEST_DURATION ]] || TEST_DURATION=300
-[[ -n $RAMP_UP_TIME ]] || RAMP_UP_TIME=60
-[[ -n $NUMBER_OF_VALIDATOR_NODES ]] || NUMBER_OF_VALIDATOR_NODES=2
-[[ -n $NUMBER_OF_CLIENT_NODES ]] || NUMBER_OF_CLIENT_NODES=1
-[[ -n $TESTNET_ZONES ]] || TESTNET_ZONES="us-west1-a"
+function execution_step {
+  # shellcheck disable=SC2124
+  STEP="$@"
+  echo --- "${STEP[@]}"
+}
 
 function collect_logs {
-  echo --- collect logs from remote nodes
+  execution_step "Collect logs from remote nodes"
   rm -rf net/log
   net/net.sh logs
   for logfile in net/log/* ; do
@@ -25,18 +20,73 @@ function collect_logs {
   done
 }
 
+function analyze_packet_loss {
+  (
+    set -x
+    # shellcheck disable=SC1091
+    source net/config/config
+    mkdir -p iftop-logs
+    execution_step "Map private -> public IP addresses in iftop logs"
+    # shellcheck disable=SC2154
+    for i in "${!validatorIpList[@]}"; do
+      # shellcheck disable=SC2154
+      # shellcheck disable=SC2086
+      # shellcheck disable=SC2027
+      echo "{\"private\": \""${validatorIpListPrivate[$i]}""\", \"public\": \""${validatorIpList[$i]}""\"},"
+    done > ip_address_map.txt
+
+    for ip in "${validatorIpList[@]}"; do
+      net/scp.sh ip_address_map.txt solana@"$ip":~/solana/
+    done
+
+    execution_step "Remotely post-process iftop logs"
+    # shellcheck disable=SC2154
+    for ip in "${validatorIpList[@]}"; do
+      iftop_log=iftop-logs/$ip-iftop.log
+      # shellcheck disable=SC2016
+      net/ssh.sh solana@"$ip" 'PATH=$PATH:~/.cargo/bin/ ~/solana/scripts/iftop-postprocess.sh ~/solana/iftop.log temp.log ~solana/solana/ip_address_map.txt' > "$iftop_log"
+      upload-ci-artifact "$iftop_log"
+    done
+
+    execution_step "Analyzing Packet Loss"
+    solana-release/bin/solana-log-analyzer analyze -f ./iftop-logs/ | sort -k 2 -g
+  )
+}
+
 function cleanup_testnet {
+  RC=$?
+  if [[ $RC != 0 ]] ; then
+    RESULT_DETAILS="
+Test failed during step:
+${STEP}
+
+Failure occured when running the following command:
+$(eval echo "$@")"
+  fi
+
+  FINISH_UNIX_MSECS="$(($(date +%s%N)/1000000))"
+  if [[ "$UPLOAD_RESULTS_TO_SLACK" = "true" ]] ; then
+    upload_results_to_slack
+  fi
+
   (
     set +e
+    execution_step "Collecting Logfiles from Nodes"
     collect_logs
   )
 
   (
     set +e
-    echo --- Stop Network Software
+    execution_step "Stop Network Software"
     net/net.sh stop
   )
 
+  (
+    set +e
+    analyze_packet_loss
+  )
+
+  execution_step "Deleting Testnet"
   case $CLOUD_PROVIDER in
   gce)
   (
@@ -45,6 +95,32 @@ function cleanup_testnet {
   continue_on_failure: true
 
 - command: "net/gce.sh delete -p ${TESTNET_TAG}"
+  label: "Delete Testnet"
+  agents:
+    - "queue=testnet-deploy"
+EOF
+  ) | buildkite-agent pipeline upload
+  ;;
+  ec2)
+  (
+    cat <<EOF
+- wait: ~
+  continue_on_failure: true
+
+- command: "net/ec2.sh delete -p ${TESTNET_TAG}"
+  label: "Delete Testnet"
+  agents:
+    - "queue=testnet-deploy"
+EOF
+  ) | buildkite-agent pipeline upload
+  ;;
+  azure)
+  (
+    cat <<EOF
+- wait: ~
+  continue_on_failure: true
+
+- command: "net/azure.sh delete -p ${TESTNET_TAG}"
   label: "Delete Testnet"
   agents:
     - "queue=testnet-deploy"
@@ -69,89 +145,180 @@ EOF
     ;;
   esac
 }
-trap cleanup_testnet EXIT
+trap 'cleanup_testnet $BASH_COMMAND' EXIT
 
-launchTestnet() {
+function launchTestnet() {
   set -x
 
   # shellcheck disable=SC2068
-  echo --- create "$NUMBER_OF_VALIDATOR_NODES" nodes
+  execution_step "Create ${NUMBER_OF_VALIDATOR_NODES} ${CLOUD_PROVIDER} nodes"
 
   case $CLOUD_PROVIDER in
     gce)
+      if [[ -z $VALIDATOR_NODE_MACHINE_TYPE ]] ; then
+        echo VALIDATOR_NODE_MACHINE_TYPE not defined
+        exit 1
+      fi
     # shellcheck disable=SC2068
+    # shellcheck disable=SC2086
       net/gce.sh create \
         -d pd-ssd \
         -n "$NUMBER_OF_VALIDATOR_NODES" -c "$NUMBER_OF_CLIENT_NODES" \
-        "$maybeMachineType" "$VALIDATOR_NODE_MACHINE_TYPE" \
-        -p "$TESTNET_TAG" ${TESTNET_CLOUD_ZONES[@]/#/"-z "} "$ADDITIONAL_FLAGS"
+        $maybeCustomMachineType "$VALIDATOR_NODE_MACHINE_TYPE" $maybeEnableGpu \
+        -p "$TESTNET_TAG" $maybeCreateAllowBootFailures $maybePublicIpAddresses \
+        ${TESTNET_CLOUD_ZONES[@]/#/"-z "} \
+        ${ADDITIONAL_FLAGS[@]/#/" "}
+      ;;
+    ec2)
+    # shellcheck disable=SC2068
+    # shellcheck disable=SC2086
+      net/ec2.sh create \
+        -n "$NUMBER_OF_VALIDATOR_NODES" -c "$NUMBER_OF_CLIENT_NODES" \
+        $maybeCustomMachineType "$VALIDATOR_NODE_MACHINE_TYPE" $maybeEnableGpu \
+        -p "$TESTNET_TAG" $maybeCreateAllowBootFailures $maybePublicIpAddresses \
+        ${TESTNET_CLOUD_ZONES[@]/#/"-z "} \
+        ${ADDITIONAL_FLAGS[@]/#/" "}
+      ;;
+    azure)
+    # shellcheck disable=SC2068
+    # shellcheck disable=SC2086
+      net/azure.sh create \
+        -n "$NUMBER_OF_VALIDATOR_NODES" -c "$NUMBER_OF_CLIENT_NODES" \
+        $maybeCustomMachineType "$VALIDATOR_NODE_MACHINE_TYPE" $maybeEnableGpu \
+        -p "$TESTNET_TAG" $maybeCreateAllowBootFailures $maybePublicIpAddresses \
+        ${TESTNET_CLOUD_ZONES[@]/#/"-z "} \
+        ${ADDITIONAL_FLAGS[@]/#/" "}
       ;;
     colo)
+    # shellcheck disable=SC2068
+    # shellcheck disable=SC2086
       net/colo.sh create \
-        -n "$NUMBER_OF_VALIDATOR_NODES" -c "$NUMBER_OF_CLIENT_NODES" -g \
-        -p "$TESTNET_TAG" "$ADDITIONAL_FLAGS"
+        -n "$NUMBER_OF_VALIDATOR_NODES" -c "$NUMBER_OF_CLIENT_NODES" $maybeEnableGpu \
+        -p "$TESTNET_TAG" $maybePublicIpAddresses \
+        ${ADDITIONAL_FLAGS[@]/#/" "}
       ;;
     *)
       echo "Error: Unsupported cloud provider: $CLOUD_PROVIDER"
       ;;
     esac
 
-  echo --- configure database
+  execution_step "Configure database"
   net/init-metrics.sh -e
 
-  echo --- start "$NUMBER_OF_VALIDATOR_NODES" node test
-  if [[ -n $CHANNEL ]]; then
-    net/net.sh start -t "$CHANNEL" "$maybeClientOptions" "$CLIENT_OPTIONS"
-  else
-    net/net.sh start -T solana-release*.tar.bz2 "$maybeClientOptions" "$CLIENT_OPTIONS"
+  execution_step "Fetch reusable testnet keypairs"
+  if [[ ! -d net/keypairs ]] ; then
+    git clone git@github.com:solana-labs/testnet-keypairs.git net/keypairs
+    # If we have provider-specific keys (CoLo*, GCE*, etc) use them instead of generic val*
+    if [[ -d net/keypairs/"${CLOUD_PROVIDER}" ]] ; then
+      cp net/keypairs/"${CLOUD_PROVIDER}"/* net/keypairs/
+    fi
   fi
 
-  echo --- wait "$RAMP_UP_TIME" seconds for network throughput to stabilize
+  if [[ "$CLOUD_PROVIDER" = "colo" ]] ; then
+    execution_step "Stopping Colo nodes before we start"
+    net/net.sh stop
+  fi
+
+  execution_step "Start ${NUMBER_OF_VALIDATOR_NODES} node test"
+  if [[ -n $CHANNEL ]]; then
+    # shellcheck disable=SC2068
+    # shellcheck disable=SC2086
+    net/net.sh start -t "$CHANNEL" \
+      "$maybeClientOptions" "$CLIENT_OPTIONS" $maybeStartAllowBootFailures \
+      --gpu-mode $startGpuMode
+  else
+    # shellcheck disable=SC2068
+    # shellcheck disable=SC2086
+    net/net.sh start -T solana-release*.tar.bz2 \
+      "$maybeClientOptions" "$CLIENT_OPTIONS" $maybeStartAllowBootFailures \
+      --gpu-mode $startGpuMode
+  fi
+
+  execution_step "Wait ${RAMP_UP_TIME} seconds for network throughput to stabilize"
   sleep "$RAMP_UP_TIME"
 
-  echo --- wait "$TEST_DURATION" seconds to complete test
-  sleep "$TEST_DURATION"
+  execution_step "Wait ${TEST_DURATION_SECONDS} seconds to complete test"
+  sleep "$TEST_DURATION_SECONDS"
 
-  echo --- collect statistics about run
+  execution_step "Collect statistics about run"
   declare q_mean_tps='
-    SELECT round(mean("sum_count")) AS "mean_tps" FROM (
-      SELECT sum("count") AS "sum_count"
-        FROM "'$TESTNET_TAG'"."autogen"."banking_stage-record_transactions"
-        WHERE time > now() - '"$TEST_DURATION"'s GROUP BY time(1s)
+    SELECT ROUND(MEAN("median_sum")) as "mean_tps" FROM (
+      SELECT MEDIAN(sum_count) AS "median_sum" FROM (
+        SELECT SUM("count") AS "sum_count"
+          FROM "'$TESTNET_TAG'"."autogen"."bank-process_transactions"
+          WHERE time > now() - '"$TEST_DURATION_SECONDS"'s AND count > 0
+          GROUP BY time(1s), host_id)
+      GROUP BY time(1s)
     )'
 
   declare q_max_tps='
-    SELECT round(max("sum_count")) AS "max_tps" FROM (
-      SELECT sum("count") AS "sum_count"
-        FROM "'$TESTNET_TAG'"."autogen"."banking_stage-record_transactions"
-        WHERE time > now() - '"$TEST_DURATION"'s GROUP BY time(1s)
+    SELECT MAX("median_sum") as "max_tps" FROM (
+      SELECT MEDIAN(sum_count) AS "median_sum" FROM (
+        SELECT SUM("count") AS "sum_count"
+          FROM "'$TESTNET_TAG'"."autogen"."bank-process_transactions"
+          WHERE time > now() - '"$TEST_DURATION_SECONDS"'s AND count > 0
+          GROUP BY time(1s), host_id)
+      GROUP BY time(1s)
     )'
 
   declare q_mean_confirmation='
-    SELECT round(mean("duration_ms")) as "mean_confirmation"
+    SELECT round(mean("duration_ms")) as "mean_confirmation_ms"
       FROM "'$TESTNET_TAG'"."autogen"."validator-confirmation"
-      WHERE time > now() - '"$TEST_DURATION"'s'
+      WHERE time > now() - '"$TEST_DURATION_SECONDS"'s'
 
   declare q_max_confirmation='
-    SELECT round(max("duration_ms")) as "max_confirmation"
+    SELECT round(max("duration_ms")) as "max_confirmation_ms"
       FROM "'$TESTNET_TAG'"."autogen"."validator-confirmation"
-      WHERE time > now() - '"$TEST_DURATION"'s'
+      WHERE time > now() - '"$TEST_DURATION_SECONDS"'s'
 
   declare q_99th_confirmation='
-    SELECT round(percentile("duration_ms", 99)) as "99th_confirmation"
+    SELECT round(percentile("duration_ms", 99)) as "99th_percentile_confirmation_ms"
       FROM "'$TESTNET_TAG'"."autogen"."validator-confirmation"
-      WHERE time > now() - '"$TEST_DURATION"'s'
+      WHERE time > now() - '"$TEST_DURATION_SECONDS"'s'
 
-  RESULTS_FILE="$TESTNET_TAG"_SUMMARY_STATS_"$NUMBER_OF_VALIDATOR_NODES".log
   curl -G "${INFLUX_HOST}/query?u=ro&p=topsecret" \
     --data-urlencode "db=${TESTNET_TAG}" \
     --data-urlencode "q=$q_mean_tps;$q_max_tps;$q_mean_confirmation;$q_max_confirmation;$q_99th_confirmation" |
-    python system-test/testnet-performance/testnet-automation-json-parser.py >>"$RESULTS_FILE"
+    python system-test/testnet-performance/testnet-automation-json-parser.py >>"$RESULT_FILE"
 
-  upload-ci-artifact "$RESULTS_FILE"
+  execution_step "Writing test results to ${RESULT_FILE}"
+  RESULT_DETAILS=$(<"$RESULT_FILE")
+  upload-ci-artifact "$RESULT_FILE"
 }
 
+RESULT_DETAILS=
+STEP=
+execution_step "Initialize Environment"
+
 cd "$(dirname "$0")/../.."
+
+[[ -n $TESTNET_TAG ]] || TESTNET_TAG=testnet-automation
+[[ -n $INFLUX_HOST ]] || INFLUX_HOST=https://metrics.solana.com:8086
+[[ -n $RAMP_UP_TIME ]] || RAMP_UP_TIME=0
+
+if [[ -z $TEST_DURATION_SECONDS ]] ; then
+  echo TEST_DURATION_SECONDS not defined
+  exit 1
+fi
+
+if [[ -z $NUMBER_OF_VALIDATOR_NODES ]] ; then
+  echo NUMBER_OF_VALIDATOR_NODES not defined
+  exit 1
+fi
+
+startGpuMode="off"
+if [[ -z $ENABLE_GPU ]] ; then
+  ENABLE_GPU=false
+fi
+if [[ "$ENABLE_GPU" = "true" ]] ; then
+  maybeEnableGpu="--enable-gpu"
+  startGpuMode="on"
+fi
+
+if [[ -z $NUMBER_OF_CLIENT_NODES ]] ; then
+  echo NUMBER_OF_CLIENT_NODES not defined
+  exit 1
+fi
 
 if [[ -z $SOLANA_METRICS_CONFIG ]]; then
   if [[ -z $SOLANA_METRICS_PARTIAL_CONFIG ]]; then
@@ -162,17 +329,57 @@ if [[ -z $SOLANA_METRICS_CONFIG ]]; then
 fi
 echo "SOLANA_METRICS_CONFIG: $SOLANA_METRICS_CONFIG"
 
+if [[ -z $ALLOW_BOOT_FAILURES ]] ; then
+  ALLOW_BOOT_FAILURES=false
+fi
+if [[ "$ALLOW_BOOT_FAILURES" = "true" ]] ; then
+  maybeCreateAllowBootFailures="--allow-boot-failures"
+  maybeStartAllowBootFailures="-F"
+fi
+
+if [[ -z $USE_PUBLIC_IP_ADDRESSES ]] ; then
+  USE_PUBLIC_IP_ADDRESSES=false
+fi
+if [[ "$USE_PUBLIC_IP_ADDRESSES" = "true" ]] ; then
+  maybePublicIpAddresses="-P"
+fi
+
 if [[ -z $CHANNEL ]]; then
-  echo --- downloading tar from build artifacts
+  execution_step "Downloading tar from build artifacts"
   buildkite-agent artifact download "solana-release*.tar.bz2" .
 fi
 
 # shellcheck disable=SC1091
 source ci/upload-ci-artifact.sh
+source system-test/testnet-performance/upload_results_to_slack.sh
 
 maybeClientOptions=${CLIENT_OPTIONS:+"-c"}
-maybeMachineType=${VALIDATOR_NODE_MACHINE_TYPE:+"-G"}
+maybeCustomMachineType=${VALIDATOR_NODE_MACHINE_TYPE:+"--custom-machine-type"}
 
 IFS=, read -r -a TESTNET_CLOUD_ZONES <<<"${TESTNET_ZONES}"
+
+RESULT_FILE="$TESTNET_TAG"_SUMMARY_STATS_"$NUMBER_OF_VALIDATOR_NODES".log
+rm -f "$RESULT_FILE"
+
+TEST_PARAMS_TO_DISPLAY=(CLOUD_PROVIDER \
+                        NUMBER_OF_VALIDATOR_NODES \
+                        ENABLE_GPU \
+                        VALIDATOR_NODE_MACHINE_TYPE \
+                        NUMBER_OF_CLIENT_NODES \
+                        CLIENT_OPTIONS \
+                        TESTNET_ZONES \
+                        TEST_DURATION_SECONDS \
+                        USE_PUBLIC_IP_ADDRESSES \
+                        ALLOW_BOOT_FAILURES \
+                        ADDITIONAL_FLAGS)
+
+TEST_CONFIGURATION=
+for i in "${TEST_PARAMS_TO_DISPLAY[@]}" ; do
+  if [[ -n ${!i} ]] ; then
+    TEST_CONFIGURATION+="${i} = ${!i} | "
+  fi
+done
+
+START_UNIX_MSECS="$(($(date +%s%N)/1000000))"
 
 launchTestnet
